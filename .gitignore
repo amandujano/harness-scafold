@@ -1,0 +1,62 @@
+.atl
+
+# ==========================================
+# Dependencies
+# ==========================================
+node_modules/
+.pnp
+.pnp.js
+
+# ==========================================
+# TypeScript & Build Outputs
+# ==========================================
+# Ignore the main build/distribution directories
+dist/
+build/
+lib/
+out/
+
+# Ignore TypeScript build cache metadata
+*.tsbuildinfo
+
+# Optional: Ignore compiled JS files ONLY if they are generated next to TS source files.
+# Un-comment the next lines if you compile your .ts to .js in the same source folder.
+# src/**/*.js
+# src/**/*.js.map
+# src/**/*.d.ts
+
+# ==========================================
+# Testing & Code Coverage
+# ==========================================
+coverage/
+.nyc_output/
+*.log
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ==========================================
+# IDEs and System Files
+# ==========================================
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# JetBrains (WebStorm, IntelliJ)
+.idea/
+*.iml
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json

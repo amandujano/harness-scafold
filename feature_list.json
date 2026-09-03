@@ -1,0 +1,32 @@
+{
+  "project": "n8n",
+  "description": "",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "require_approved_spec_to_implement": true,
+    "valid_status": [
+      "pending",
+      "spec_ready",
+      "in_progress",
+      "done",
+      "blocked"
+    ],
+    "sdd_required_when": "feature has \"sdd\": true"
+  },
+  "features": [
+    {
+      "id": 1,
+      "name": "example-feature",
+      "title": "Example Feature",
+      "description": "A simple example feature to demonstrate the SDD workflow. This feature should implement a basic greeting endpoint that returns 'Hello World'.",
+      "acceptance": [
+        "GET /hello returns 200 OK with body 'Hello World'",
+        "Request is logged to stdout",
+        "Unit tests cover the greeting logic"
+      ],
+      "sdd": true,
+      "status": "pending"
+    }
+  ]
+}
