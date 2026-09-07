@@ -1,0 +1,66 @@
+{
+  "project": "n8n",
+  "description": "Technical debt incurred by agents during coding sessions. Deliberately mirrors the structure of feature_list.json so a debt item can be promoted into a feature without being rewritten.",
+  "rules": {
+    "record_when_incurred": true,
+    "one_debt_per_shortcut": true,
+    "require_origin": true,
+    "silence_is_a_violation": true,
+    "only_leader_changes_status": true,
+    "block_session_close_when": "any debt with severity \"critical\" is in status \"open\"",
+    "valid_status": [
+      "open",
+      "accepted",
+      "scheduled",
+      "in_progress",
+      "resolved",
+      "wontfix"
+    ],
+    "valid_severity": [
+      "low",
+      "medium",
+      "high",
+      "critical"
+    ],
+    "valid_kind": [
+      "shortcut",
+      "missing_test",
+      "spec_deviation",
+      "architecture_violation",
+      "duplication",
+      "unverified_assumption",
+      "tooling",
+      "documentation"
+    ],
+    "promotion_rule": "A debt with \"sdd\": true cannot be paid in place. The leader copies it into feature_list.json as a pending feature and sets its status here to \"scheduled\".",
+    "resolution_rule": "A debt moves to \"resolved\" only when every entry in its \"acceptance\" array is verifiably true, exactly like a feature."
+  },
+  "debts": [
+    {
+      "id": 1,
+      "name": "example-debt",
+      "title": "Example Debt — greeting handler has no error-path test",
+      "description": "While implementing example-feature the implementer shipped the happy path only. The error path (malformed request) is implemented but has no test, so a regression there would pass CI silently. Recorded instead of silently skipped.",
+      "kind": "missing_test",
+      "severity": "medium",
+      "origin": {
+        "agent": "implementer",
+        "feature": "example-feature",
+        "task": "T3",
+        "session": "2026-09-06"
+      },
+      "location": [
+        "src/",
+        "tests/"
+      ],
+      "interest": "Every future change to the greeting handler is unverified on its failure path. Cost grows with each feature that touches it.",
+      "acceptance": [
+        "A test asserts a non-2xx response for a malformed request",
+        "The test asserts the concrete error body, not merely that no exception is raised",
+        "The test is mapped to an R<n> in specs/example-feature/requirements.md"
+      ],
+      "sdd": false,
+      "status": "open"
+    }
+  ]
+}

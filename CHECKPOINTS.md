@@ -49,8 +49,27 @@
 - [ ] Each `R<n>` from `requirements.md` is covered by at least one concrete
       test in `tests/`.
 
+## C7 — Technical Debt is Declared, Not Hidden
+
+- [ ] `techdebt_list.json` exists and is valid JSON.
+- [ ] Every debt entry has a non-empty `acceptance` array whose items are
+      verifiable — the same bar as a feature.
+- [ ] Every debt entry has an `origin` naming the agent, feature and session
+      that produced it.
+- [ ] No debt with `severity: "critical"` is left in status `open`.
+- [ ] Every shortcut visible in the session's diff has a matching entry. A clean
+      ledger next to a diff full of compromises is a **failing** checkpoint, not
+      a passing one.
+- [ ] Every debt in status `scheduled` with `"sdd": true` has a corresponding
+      `pending` feature in `feature_list.json`.
+
 ---
 
 **How to use this file:** a reviewer agent (`.claude/agents/reviewer.md`)
 goes through each checkbox, marks `[x]` or `[ ]`, and rejects the session closure
-if any boxes in C1-C6 remain empty.
+if any boxes in C1-C7 remain empty.
+
+> **On C7:** an empty debt ledger is only credible when the diff is genuinely
+> clean. The purpose of the ledger is to make compromises *visible*, so a
+> reviewer that never finds debt is either reviewing perfect work or not
+> reviewing at all.

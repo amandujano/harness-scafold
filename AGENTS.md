@@ -13,6 +13,8 @@
 2. Read `progress/current.md` to understand the state of the last session.
 3. Read `feature_list.json`. Every new feature (`"sdd": true`) goes through
    **Spec Driven Development** — see `docs/specs.md` and §4 of this file.
+   Read `techdebt_list.json` in the same pass: open `critical` debt outranks new
+   feature work.
 4. Read `docs/specs.md` before touching any spec or feature `sdd: true`.
 
 ## 2. Repository Map
@@ -20,6 +22,7 @@
 | File / Folder            | Content                                                                     | When to read |
 |--------------------------|-----------------------------------------------------------------------------|---------------|
 | `feature_list.json`      | Task list with status (`pending` / `spec_ready` / `in_progress` / `done` / `blocked`) | Always, at the start |
+| `techdebt_list.json`     | Ledger of shortcuts taken by agents. Same schema as `feature_list.json`      | Always, at the start; and whenever you take a shortcut |
 | `progress/current.md`    | Current session state                                                       | Always, at the start |
 | `progress/history.md`    | Append-only log of previous sessions                                         | If you need historical context |
 | `specs/<feature>/`       | `requirements.md` + `design.md` + `tasks.md` (Kiro-style)                   | Before implementing any feature with `"sdd": true` |
@@ -27,6 +30,7 @@
 | `docs/conventions.md`    | Style rules, naming, structure                                             | Before writing code |
 | `docs/specs.md`          | SDD Process: EARS notation, the 3 files, human approval gate               | Before drafting or reading a spec |
 | `docs/verification.md`   | How to verify your work functions (includes requirements traceability)    | Before declaring a task as `done` |
+| `docs/model_strategy.md` | Which model each agent runs on and why                                      | Before changing an agent's `model:` frontmatter |
 | `CHECKPOINTS.md`        | Objective criteria for "correct final state"                                | For self-evaluation |
 | `.claude/agents/`        | Sub-agent definitions (`leader`, `spec_author`, `implementer`, `reviewer`) | If orchestrating work |
 | `src/`                  | Application code                                                          | To implement |
@@ -42,6 +46,8 @@
 - **Do not skip the human approval gate.** The leader stops the flow
   at `spec_ready` and waits.
 - **Document what you do** in `progress/current.md` while working, not at the end.
+- **Declare every shortcut** in `techdebt_list.json` the moment you take it. An
+  undeclared shortcut is a rejection, not a time saving.
 - **Leave the repository clean** before closing the session (see §5).
 - **If you don't know something, look in `docs/`** before inventing it.
 
@@ -69,6 +75,8 @@ Before finishing:
 
 1. Run `./init.sh` — all green.
 2. If the task is finished: mark `status: "done"` in `feature_list.json`.
+   Confirm no debt with `severity: "critical"` is left `open` in
+   `techdebt_list.json`; if there is, the session does not close.
 3. Move the summary from `progress/current.md` to the end of `progress/history.md`.
 4. Empty `progress/current.md` leaving only the template.
 5. Do not leave temporary files, debug `print()` statements, or contextless TODOs.

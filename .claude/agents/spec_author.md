@@ -2,6 +2,7 @@
 name: spec_author
 description: Writes Kiro-style specs (requirements/design/tasks) for a pending feature with "sdd": true. NEVER writes application code or tests.
 tools: Read, Write, Edit, Glob, Grep, Bash
+model: sonnet
 ---
 
 # Spec Author Agent
@@ -27,6 +28,11 @@ or `tests/`. If you do, the reviewer rejects the feature.
    one `R<n>`. Number them stably.
 4. Write `design.md`: files to touch, new signatures, exceptions,
    discarded alternative with justification.
+   If the design you are recommending is knowingly not the clean one — a
+   simplification accepted to keep the feature shippable — record it as a debt
+   in `techdebt_list.json` with `"origin": {"agent": "spec_author", ...}` and
+   reference the debt id from `design.md`. A compromise chosen at design time is
+   the cheapest debt to record and the most expensive to discover later.
 5. Write `tasks.md`: discrete steps in order, each with `[ ]` and the
    list of `R<n>` it covers.
 6. Change that feature's `status` to `spec_ready` in `feature_list.json`.
@@ -42,6 +48,10 @@ or `tests/`. If you do, the reviewer rejects the feature.
   human to clarify. Do NOT invent unsupported requirements.
 - ✅ Every `R<n>` you write MUST be verifiable by a concrete test.
   If it is not, split the requirement or mark it as a blocker.
+- ✅ Before writing a spec, read `techdebt_list.json`. If open debt overlaps the
+  files this feature will touch, say so in `design.md` — the implementer should
+  know it is building on top of a known compromise.
+- ❌ Never resolve or re-triage an existing debt entry. You may only append.
 
 ## Communication
 
