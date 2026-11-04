@@ -2811,6 +2811,25 @@ class BashWriterTests(HookCase):
     def test_target_directory_forms_stay_allowed_for_the_owner(self):
         self.assert_allowed(self.bash("cp -t src/app /tmp/a.py", "implementer"))
 
+    def test_heredoc_text_is_data_not_commands(self):
+        review = ".harness/progress/review_alpha.md"
+        for body in ("- A1 -> tests pass", "run harness approve alpha", "rm .harness/rules.json"):
+            with self.subTest(body=body):
+                self.assert_allowed(self.bash(f"cat > {review} <<'EOF'\n{body}\nEOF", "reviewer"))
+
+    def test_commands_after_a_heredoc_are_still_inspected(self):
+        command = "cat > .harness/progress/review_alpha.md <<'EOF'\ntext\nEOF\nrm .harness/rules.json"
+        self.assert_blocked(self.bash(command, "reviewer"))
+
+    def test_heredoc_redirect_target_is_still_checked(self):
+        self.assert_blocked(self.bash("cat > .harness/rules.json <<'EOF'\n{}\nEOF", "reviewer"))
+
+    def test_heredocs_that_are_executed_are_still_inspected(self):
+        for command in ("bash <<'EOF'\nrm .harness/rules.json\nEOF",
+                        "cat <<'EOF' | sh\nrm .harness/rules.json\nEOF"):
+            with self.subTest(command=command):
+                self.assert_blocked(self.bash(command, "reviewer"))
+
     def test_reading_the_cli_with_output_discarded_is_not_a_copy(self):
         for command in ("grep -n foo .harness/bin/harness 2>/dev/null", "cat .harness/bin/harness >/dev/null",
                         "grep -n foo .harness/bin/harness 2>/dev/null | head"):

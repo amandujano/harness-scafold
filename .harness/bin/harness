@@ -1606,6 +1606,7 @@ def file_tool_denial(root, rules, role, payload):
 SEPARATORS = {";", "|", "||", "&", "&&", "(", ")", "|&", ";;"}
 WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>", "<>", ">&"}
 READ_REDIRECTS = {"<", "<<", "<<<"}
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 WRAPPERS = {"sudo", "env", "command", "time", "nohup", "xargs", "exec"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 ALL_ARGS_WRITE = {"rm", "rmdir", "touch", "mkdir", "tee", "truncate", "unlink", "shred", "ed", "ex"}
@@ -1628,8 +1629,29 @@ SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 
 
+def runs_its_input(line):
+    words = {os.path.basename(word) for word in re.findall(r"[\w./-]+", line)}
+    return any(word in SHELLS or word in INTERPRETERS or word.startswith("python3.") for word in words)
+
+
+def strip_data_heredocs(command):
+    """Heredoc text is data, unless a shell or interpreter on that line will run it."""
+    lines, kept, index = command.split("\n"), [], 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        opening = HEREDOC.search(line)
+        if not opening or runs_its_input(line):
+            continue
+        while index < len(lines) and lines[index].strip() != opening.group(2):
+            index += 1
+        index += 1
+    return "\n".join(kept)
+
+
 def tokenize(command):
-    command = re.sub(r"\$\(\s*pwd\s*\)|`\s*pwd\s*`", "$PWD", command)
+    command = re.sub(r"\$\(\s*pwd\s*\)|`\s*pwd\s*`", "$PWD", strip_data_heredocs(command))
     lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
