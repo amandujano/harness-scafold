@@ -30,6 +30,8 @@ read it first. This skill covers how to write a spec that passes.
   rewrite it or stop with `blocked`.
 - State the failure paths with the `IF ... THEN` pattern, not only the happy path.
 - Name observable results, not implementation.
+- Describe the system, not its test suite. Tests prove requirements; a requirement that
+  says tests must exist has nothing of its own to verify.
 
 ## Writing the Design
 

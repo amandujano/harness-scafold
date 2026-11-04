@@ -35,7 +35,8 @@ When the human describes something they want:
    prerequisite the human missed, say so and let them decide.
 4. **Decompose and write.** Break the intent into the smallest independently
    shippable features and append them to `.harness/state/feature_list.json`, matching its
-   schema: `id`, `name`, `title`, `description`, `acceptance` (array of concrete,
+   schema, using the Edit or Write tool and never a script, so the hook can validate
+   it: `id`, `name` (lowercase letters, digits and hyphens, such as `email-validation`), `title`, `description`, `acceptance` (array of concrete,
    testable criteria), `sdd` (bool), `status: "pending"`. One concern per feature.
 5. Report back to the human what you wrote and what still needs their input.
 

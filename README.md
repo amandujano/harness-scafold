@@ -197,6 +197,8 @@ What to know before relying on it:
 - It applies to the whole session, not per role. The hook still separates roles.
 - `.harness/state/` stays writable because `harness transition` needs it, so state is
   still only guarded by the hook and by `harness check`.
+- Toolchains installed under your home, such as Anaconda or nvm, get read-only access. Before
+  starting, `harness sandbox` proves the hook blocks inside it, and refuses to start if not.
 - `harness approve` must run from your own terminal, outside the sandbox.
 - `.git/` is read-only inside it, so commit from outside.
 - `~/.claude` stays writable because Claude Code needs it, so a sandboxed agent could change
@@ -257,8 +259,9 @@ compared case-insensitively. Agent types outside the four roles may write only w
 `unknown_role_allow` lists, which excludes `src/`, `.harness/` and `.claude/`.
 
 Evidence has one owner: only `reviewer` writes `.harness/progress/review_*`, and only
-`implementer` writes `.harness/progress/impl_*`. A feature's `name` and `sdd` are
-immutable for agents; a human edits them directly.
+`implementer` writes `.harness/progress/impl_*`. A feature's `sdd` is immutable for
+agents, and so is its `name` once a spec, approval or report exists; a human edits them
+directly. Feature files are validated on write, so an invalid name is refused at once.
 
 The debt ledger keeps every entry: no agent may remove one or mark it `resolved` by
 hand. Only a human may lower, accept or drop a `critical` debt.

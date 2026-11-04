@@ -43,6 +43,8 @@ CHECKPOINTS_HEADER = ("<!-- Generated from .harness/rules.json by `harness check
                       "Do not edit by hand. -->")
 RUNTIME_TEMPLATES = ("progress_current.md",)
 SANDBOX_PROFILE = ".harness/sandbox-profile.json"
+SANDBOX_PREFLIGHT_SECONDS = 30
+EXIT_HOOK_BLOCK = 2
 SANDBOX_NEVER_WRITABLE = (".harness/approvals", ".harness/bin", ".harness/rules.json", ".harness/config.json",
                           ".harness", ".claude", ".git", ".github")
 TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders")
@@ -624,7 +626,7 @@ def app_source_text(ctx):
 
 def mapped_test_names(target):
     quoted = re.findall(r"`([^`]+)`", target)
-    return quoted or target.split()[:1]
+    return quoted or [part.split()[0] for part in target.split(",") if part.strip()]
 
 
 def guard_traceability(ctx, feature, reason=None):
@@ -1467,7 +1469,17 @@ def simulate_edit(path, tool, tool_input):
     return text
 
 
-def feature_list_denial(current, proposed):
+def feature_has_artifacts(root, name):
+    harness = Path(root) / HARNESS_DIR
+    paths = (harness / "specs" / name, harness / "approvals" / f"{name}.json",
+             harness / "progress" / f"impl_{name}.md", harness / "progress" / f"review_{name}.md")
+    return any(path.exists() for path in paths)
+
+
+def feature_list_denial(root, rules, current, proposed):
+    introduced = [e for e in validate_features(proposed, rules) if e not in validate_features(current, rules)]
+    if introduced:
+        return introduced[0]
     before = {f.get("id"): f for f in current.get("features", [])}
     after = {f.get("id"): f for f in proposed.get("features", [])}
     after_names = {f.get("name"): f.get("id") for f in proposed.get("features", [])}
@@ -1479,9 +1491,12 @@ def feature_list_denial(current, proposed):
             if name in after_names:
                 return f"id of {name} is immutable for agents"
             continue
-        for field in ("name", "sdd"):
-            if feature.get(field) != after[key].get(field):
-                return f"{field} of {name} is immutable for agents; a human edits it directly"
+        renamed = after[key].get("name")
+        if renamed != name and (feature.get("status") != "pending" or feature_has_artifacts(root, name)
+                                or feature_has_artifacts(root, renamed)):
+            return f"name of {name} is immutable once work exists; a human edits it directly"
+        if feature.get("sdd") != after[key].get("sdd"):
+            return f"sdd of {name} is immutable for agents; a human edits it directly"
         for field in ("status", "blocked_from", "blocked_reason", "evidence"):
             if feature.get(field) != after[key].get(field):
                 return f"{field} of {name} changes only through `harness transition`"
@@ -1540,7 +1555,7 @@ def state_edit_denial(root, rel, role, rules, tool, tool_input, path):
     except (ValueError, HarnessError) as exc:
         return f"edit to {rel} would leave invalid JSON: {exc}"
     if rel == FEATURES.casefold():
-        return feature_list_denial(current, proposed)
+        return feature_list_denial(root, rules, current, proposed)
     if rel == DEBTS.casefold():
         if role in rules["debt"]["append_only_roles"]:
             return debt_list_denial(current, proposed)
@@ -1992,10 +2007,11 @@ def wrapper_denial(name, argv, command):
     if name in PTY_WRAPPERS and mentions_cli(text):
         return f"{name} cannot wrap the harness CLI"
     if name in INTERPRETERS or name.startswith("python3."):
-        if "harness" in text.casefold() and re.search(r"\bpty\b|\bapprove\b", text):
+        script = command if "<<" in command else text
+        if "harness" in script.casefold() and re.search(r"\bpty\b|\bapprove\b", script):
             return "interpreters cannot drive `harness approve`"
-        if any(s in text for s in SENSITIVE) and WRITE_INTENT.search(text):
-            return "scripted writes to harness files are not allowed"
+        if any(s in script for s in SENSITIVE) and WRITE_INTENT.search(script):
+            return "scripted writes to harness files are not allowed; use the Write or Edit tool, which the hook validates"
     if name in SHELLS and "-c" not in argv and not plain_args(argv) and mentions_cli(command):
         return "commands that mention the harness cannot be piped into a shell"
     return None
@@ -2054,7 +2070,7 @@ def bash_denial_for(policy, command, cwd, variables=None):
             variables.update(ASSIGNMENT.match(word).groups() for word in words)
             continue
         argv, targets, inputs = strip_redirects(words)
-        redirected = bool(targets)
+        redirected = any(target != "/dev/null" for target in targets)
         argv = unwrap(argv)
         name = os.path.basename(argv[0]) if argv else ""
         if name == "cd" and len(argv) > 1:
@@ -2964,7 +2980,19 @@ def is_temporary(path):
     return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
 
 
-def sandbox_profile(rules):
+def toolchain_read_roots(tools):
+    """Install roots under $HOME, such as Anaconda or nvm, that nono's runtime groups do not cover."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    candidates = [sys.base_prefix, sys.prefix]
+    for tool in tools:
+        path = shutil.which(tool)
+        if path:
+            candidates.append(os.path.dirname(os.path.dirname(os.path.realpath(path))))
+    roots = {os.path.realpath(path) for path in candidates}
+    return sorted(root for root in roots if root.startswith(home + os.sep))
+
+
+def sandbox_profile(rules, read_roots=()):
     """An allow-list: the project is read-only except the folders the workflow writes."""
     policy = rules["sandbox"]
     exposed = set(policy["writable"]) & set(SANDBOX_NEVER_WRITABLE)
@@ -2978,21 +3006,46 @@ def sandbox_profile(rules):
         "filesystem": {
             "allow": [f"$WORKDIR/{path}" for path in policy["writable"]] + policy["home_folders"],
             "allow_file": policy["home_files"],
-            "read": policy["login_read"],
+            "read": policy["login_read"] + list(read_roots),
             "bypass_protection": policy["login_read"],
         },
     }
 
 
+def sandbox_prefix(profile):
+    return ["nono", "run", "-s", "--allow-cwd", "--profile", str(profile), "--no-rollback", "--no-audit", "--"]
+
+
 def sandbox_command(profile, claude_args):
     arguments = claude_args[1:] if claude_args[:1] == ["--"] else claude_args
-    return ["nono", "run", "-s", "--allow-cwd", "--profile", str(profile), "--no-rollback", "--no-audit",
-            "--", "claude", *arguments]
+    return [*sandbox_prefix(profile), "claude", *arguments]
+
+
+def sandbox_preflight(root, profile):
+    """Prove the hook blocks inside the sandbox: a hook that cannot start fails open, silently."""
+    event = {"tool_name": "Write", "cwd": str(root),
+             "tool_input": {"file_path": str(root / RULES), "content": ""}}
+    command = [*sandbox_prefix(profile), str(root / HARNESS_DIR / "bin" / "harness"), "hook", "pre-tool-use"]
+    try:
+        result = subprocess.run(command, cwd=str(root), input=json.dumps(event), text=True,
+                                capture_output=True, timeout=SANDBOX_PREFLIGHT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HarnessError(f"could not test the hook inside the sandbox: {exc}") from exc
+    if result.returncode != EXIT_HOOK_BLOCK:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+        raise HarnessError(f"refusing to start: the hook does not work inside the sandbox, so no role rule "
+                           f"would be enforced ({detail[0]}). Check which python3 is first in your PATH")
+
+
+def stack_tools(root, config):
+    stack = load_json(root / HARNESS_DIR / "stacks" / config["stack"] / "stack.json")
+    return ["python3"] + [tool for alternatives in stack.get("requires", []) for tool in alternatives]
 
 
 def cmd_sandbox(args):
     root = find_root()
-    if load_config(root)["stack"] is None:
+    config = load_config(root)
+    if config["stack"] is None:
         raise HarnessError("this is the scaffold, not a project: run `harness init <stack>` first")
     rules = load_rules(root)
     if "sandbox" not in rules:
@@ -3002,7 +3055,8 @@ def cmd_sandbox(args):
     if is_temporary(root):
         raise HarnessError(f"{root} is in a temporary folder, which the sandbox cannot protect; move the project")
     path = root / SANDBOX_PROFILE
-    write_json(path, sandbox_profile(rules))
+    write_json(path, sandbox_profile(rules, toolchain_read_roots(stack_tools(root, config))))
+    sandbox_preflight(root, path)
     os.chdir(root)
     os.execvp("nono", sandbox_command(path, args.claude_args))
 

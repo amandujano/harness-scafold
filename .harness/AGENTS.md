@@ -98,3 +98,5 @@ per task is a human decision and is not automated.
 - Reread the relevant file in `.harness/docs/`.
 - If a tool does not do what you expect, or the hook blocks you, **do not invent a
   workaround**: document the blocker in `.harness/progress/current.md` and stop.
+  Using the path a block message names, such as Edit instead of a script, is following
+  the rule. It is not a workaround and not debt.

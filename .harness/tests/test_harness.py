@@ -887,6 +887,24 @@ class HumanGateTests(ProjectCase):
         self.assertTrue(record["approved_at"])
 
 
+class TraceParsingTests(unittest.TestCase):
+    def parse(self, target):
+        loader = importlib.machinery.SourceFileLoader("harness_cli", str(CLI))
+        spec = importlib.util.spec_from_loader("harness_cli", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module.mapped_test_names(target)
+
+    def test_comma_separated_names_need_no_backticks(self):
+        self.assertEqual(self.parse("test_a, test_b"), ["test_a", "test_b"])
+
+    def test_backticks_win_over_prose(self):
+        self.assertEqual(self.parse("`test_a`, see also the notes"), ["test_a"])
+
+    def test_prose_stays_unmatched_rather_than_passing(self):
+        self.assertEqual(self.parse("every test above"), ["every"])
+
+
 class EnforcementRegressionTests(HookCase):
     def test_case_spellings_do_not_bypass_protected_paths(self):
         cases = [
@@ -975,13 +993,56 @@ class EnforcementRegressionTests(HookCase):
             with self.subTest(command=command):
                 self.assert_allowed(self.bash(command, "leader"))
 
-    def test_sdd_and_name_are_immutable(self):
+    def renamed(self, name):
+        doc = self.read_json(FEATURES)
+        doc["features"][0]["name"] = name
+        return self.write_call(FEATURES, "leader", json.dumps(doc))
+
+    def test_scripted_write_block_names_the_allowed_path(self):
+        result = self.bash("python3 -c \"open('.harness/state/feature_list.json','w').write('{}')\"", "leader")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Write or Edit", result.stderr)
+
+    def test_sdd_is_immutable(self):
         self.set_features(feature())
-        for field, value in (("sdd", False), ("name", "renamed")):
-            with self.subTest(field=field):
-                doc = self.read_json(FEATURES)
-                doc["features"][0][field] = value
-                self.assert_blocked(self.write_call(FEATURES, "leader", json.dumps(doc)))
+        doc = self.read_json(FEATURES)
+        doc["features"][0]["sdd"] = False
+        self.assert_blocked(self.write_call(FEATURES, "leader", json.dumps(doc)))
+
+    def test_pending_feature_without_artifacts_can_be_renamed(self):
+        self.set_features(feature())
+        self.assert_allowed(self.renamed("renamed"))
+
+    def test_name_is_immutable_once_work_exists(self):
+        self.set_features(feature())
+        self.write_spec()
+        self.assert_blocked(self.renamed("renamed"))
+        self.set_features(feature(status="spec_ready"))
+        self.assert_blocked(self.renamed("renamed"))
+
+    def test_rename_cannot_adopt_the_artifacts_of_another_name(self):
+        self.set_features(feature())
+        self.write(".harness/approvals/renamed.json", "{}")
+        self.assert_blocked(self.renamed("renamed"))
+
+    def test_an_invalid_name_is_refused_when_written(self):
+        doc = self.read_json(FEATURES)
+        doc["features"].append(feature(name="email_validation"))
+        self.assert_blocked(self.write_call(FEATURES, "leader", json.dumps(doc)))
+
+    def test_an_invalid_name_can_be_repaired(self):
+        self.set_features(feature(name="email_validation"))
+        self.assert_allowed(self.renamed("email-validation"))
+
+    def test_scripted_heredoc_writes_to_state_are_blocked(self):
+        for body in ("import json\np='.harness/state/feature_list.json'\nd=json.load(open(p))\njson.dump(d,open(p,'w'))",
+                     "from pathlib import Path\np=Path('.harness/state/feature_list.json')\np.write_text('{}')"):
+            with self.subTest(body=body):
+                self.assert_blocked(self.bash(f"python3 - <<'PY'\n{body}\nPY", "leader"))
+
+    def test_scripted_heredoc_reads_of_state_pass(self):
+        body = "import json\nprint(json.load(open('.harness/state/feature_list.json')))"
+        self.assert_allowed(self.bash(f"python3 - <<'PY'\n{body}\nPY", "leader"))
 
     def test_sdd_cannot_change_through_edit(self):
         self.set_features(feature())
@@ -2336,6 +2397,54 @@ class SandboxTests(HookCase):
             with self.subTest(path=path), self.assertRaises(module.HarnessError):
                 module.sandbox_profile(rules)
 
+    def test_toolchains_under_home_are_readable(self):
+        module = self.load_cli()
+        home = os.path.realpath(os.path.expanduser("~"))
+        tool = self.tmp_tool(f"{home}/anaconda3/bin/python3", module)
+        self.assertIn(f"{home}/anaconda3", tool)
+        profile = module.sandbox_profile(self.read_json(RULES), tool)
+        self.assertIn(f"{home}/anaconda3", profile["filesystem"]["read"])
+        self.assertNotIn(f"{home}/anaconda3", profile["filesystem"]["allow"])
+
+    def tmp_tool(self, path, module):
+        original = (module.shutil.which, module.sys.base_prefix, module.sys.prefix)
+        module.shutil.which = lambda name: path
+        module.sys.base_prefix = module.sys.prefix = "/usr"
+        try:
+            return module.toolchain_read_roots(["python3"])
+        finally:
+            module.shutil.which, module.sys.base_prefix, module.sys.prefix = original
+
+    def test_system_toolchains_and_home_itself_are_not_added(self):
+        module = self.load_cli()
+        home = os.path.realpath(os.path.expanduser("~"))
+        self.assertEqual(self.tmp_tool("/opt/homebrew/bin/python3", module), [])
+        self.assertEqual(self.tmp_tool(f"{home}/bin/python3", module), [])
+
+    def test_stack_tools_flatten_alternatives_and_include_python(self):
+        module = self.load_cli()
+        tools = module.stack_tools(self.root, self.read_json(CONFIG))
+        self.assertEqual(tools[0], "python3")
+        self.assertTrue(all(isinstance(tool, str) for tool in tools))
+
+    def test_sandbox_refuses_to_start_when_the_hook_cannot_block(self):
+        module = self.load_cli()
+        for code in (0, 1):
+            with self.assertRaises(module.HarnessError) as caught:
+                self.preflight(module, code, "No module named 'encodings'")
+            self.assertIn("refusing to start", str(caught.exception))
+
+    def preflight(self, module, code, stderr=""):
+        original = module.subprocess.run
+        module.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, code, "", stderr)
+        try:
+            module.sandbox_preflight(self.root, "/p.json")
+        finally:
+            module.subprocess.run = original
+
+    def test_sandbox_starts_when_the_hook_blocks(self):
+        self.preflight(self.load_cli(), 2)
+
     def test_claude_arguments_pass_through(self):
         command = self.load_cli().sandbox_command("/p.json", ["--", "-p", "hello"])
         self.assertEqual(command[command.index("--") + 1:], ["claude", "-p", "hello"])
@@ -2701,6 +2810,15 @@ class BashWriterTests(HookCase):
 
     def test_target_directory_forms_stay_allowed_for_the_owner(self):
         self.assert_allowed(self.bash("cp -t src/app /tmp/a.py", "implementer"))
+
+    def test_reading_the_cli_with_output_discarded_is_not_a_copy(self):
+        for command in ("grep -n foo .harness/bin/harness 2>/dev/null", "cat .harness/bin/harness >/dev/null",
+                        "grep -n foo .harness/bin/harness 2>/dev/null | head"):
+            with self.subTest(command=command):
+                self.assert_allowed(self.bash(command, "implementer"))
+
+    def test_redirecting_the_cli_to_a_file_is_still_a_copy(self):
+        self.assert_blocked(self.bash("cat .harness/bin/harness > /tmp/copy", "implementer"))
 
     def test_target_directory_cannot_hide_a_cli_copy(self):
         for command in ("cp -t /tmp .harness/bin/harness", "cp --target-directory=/tmp .harness/bin/harness",
