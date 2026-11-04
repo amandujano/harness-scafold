@@ -1,88 +1,75 @@
 # AGENTS.md — Navigation Map for AI Agents
 
-> This file is the **entry point** for any agent working in this
-> repository. It is NOT a rule bible: it is a **map**. Read only what
-> you need when you need it (progressive disclosure).
+> This file is a **map**, not a rule bible. Read only what you need when you need
+> it. Paths are relative to the project root.
+>
+> The lifecycle, the role permissions and the invariants are defined once, in
+> `.harness/rules.json`. `.harness/bin/harness` evaluates them. If any prose
+> disagrees with that file, the file wins.
 
----
+## 1. Before Starting
 
-## 1. Before Starting (Mandatory)
-
-1. Run `./init.sh` and verify it finishes without errors. If it fails, **stop**
-   and resolve the environment before touching code.
-2. Read `progress/current.md` to understand the state of the last session.
-3. Read `feature_list.json`. Every new feature (`"sdd": true`) goes through
-   **Spec Driven Development** — see `docs/specs.md` and §4 of this file.
-   Read `techdebt_list.json` in the same pass: open `critical` debt outranks new
-   feature work.
-4. Read `docs/specs.md` before touching any spec or feature `sdd: true`.
+1. Run `.harness/bin/harness check`. If it fails, **stop** and resolve it.
+2. Run `.harness/bin/harness next`. It prints the one legal next action.
+3. Read `.harness/progress/current.md` for the state of the last session.
+4. Read `.harness/docs/specs.md` before touching any spec or `sdd: true` feature.
 
 ## 2. Repository Map
 
-| File / Folder            | Content                                                                     | When to read |
-|--------------------------|-----------------------------------------------------------------------------|---------------|
-| `feature_list.json`      | Task list with status (`pending` / `spec_ready` / `in_progress` / `done` / `blocked`) | Always, at the start |
-| `techdebt_list.json`     | Ledger of shortcuts taken by agents. Same schema as `feature_list.json`      | Always, at the start; and whenever you take a shortcut |
-| `progress/current.md`    | Current session state                                                       | Always, at the start |
-| `progress/history.md`    | Append-only log of previous sessions                                         | If you need historical context |
-| `specs/<feature>/`       | `requirements.md` + `design.md` + `tasks.md` (Kiro-style)                   | Before implementing any feature with `"sdd": true` |
-| `docs/architecture.md`   | What "doing a good job" means in this project                             | Before implementing |
-| `docs/conventions.md`    | Style rules, naming, structure                                             | Before writing code |
-| `docs/specs.md`          | SDD Process: EARS notation, the 3 files, human approval gate               | Before drafting or reading a spec |
-| `docs/verification.md`   | How to verify your work functions (includes requirements traceability)    | Before declaring a task as `done` |
-| `docs/model_strategy.md` | Which model each agent runs on and why                                      | Before changing an agent's `model:` frontmatter |
-| `CHECKPOINTS.md`        | Objective criteria for "correct final state"                                | For self-evaluation |
-| `.claude/agents/`        | Sub-agent definitions (`leader`, `spec_author`, `implementer`, `reviewer`) | If orchestrating work |
-| `src/`                  | Application code                                                          | To implement |
-| `tests/`                 | Automated tests                                                            | To verify |
+| Path | Content | When to read |
+|---|---|---|
+| `src/` | The whole application: manifest, code and tests | To implement |
+| `.harness/config.json` | Stack and test, build and lint commands, run from `src/` | Before running commands |
+| `.harness/rules.json` | States, transitions, role permissions, invariants | When a rule is unclear |
+| `.harness/state/feature_list.json` | Features and their status | Always |
+| `.harness/state/techdebt_list.json` | Ledger of shortcuts taken by agents | Always; and whenever you take a shortcut |
+| `.harness/progress/current.md` | Current session state | Always |
+| `.harness/progress/history.md` | Append-only log of previous sessions | For historical context |
+| `.harness/specs/<feature>/` | `requirements.md`, `design.md`, `tasks.md` | Before implementing an `sdd: true` feature |
+| `.harness/docs/architecture.md` | What "doing a good job" means here | Before implementing |
+| `.harness/docs/conventions.md` | Shared style rules | Before writing code |
+| `.harness/docs/stack/` | Conventions and testing guide for this stack; `harness init` creates it, so it does not exist in the scaffold itself | Before writing code or tests |
+| `.harness/docs/specs.md` | SDD process and EARS notation | Before drafting or reading a spec |
+| `.harness/docs/verification.md` | How to prove the work functions | Before closing a task |
+| `.harness/docs/model_strategy.md` | Which model each agent runs on and why | Before changing an agent's `model:` |
+| `.harness/CHECKPOINTS.md` | Criteria for a correct final state | For self-evaluation |
+| `.claude/agents/` | `leader`, `spec_author`, `implementer`, `reviewer` | If orchestrating work |
 
-## 3. Hard Rules (Non-negotiable)
+## 3. Hard Rules
 
-- **One feature at a time.** Do not mix changes from multiple tasks in the same session.
-- **Do not declare a task `done` without green tests.** Run `./init.sh` and
-  ensure the test block passes 100%.
-- **Do not skip the spec phase.** Every feature with `"sdd": true` must pass
-  through `spec_author` and obtain human approval before touching code.
-- **Do not skip the human approval gate.** The leader stops the flow
-  at `spec_ready` and waits.
-- **Document what you do** in `progress/current.md` while working, not at the end.
-- **Declare every shortcut** in `techdebt_list.json` the moment you take it. An
-  undeclared shortcut is a rejection, not a time saving.
-- **Leave the repository clean** before closing the session (see §5).
-- **If you don't know something, look in `docs/`** before inventing it.
+- **One feature at a time.** Do not mix changes from several features.
+- **Status changes only through `harness transition`.** Never edit it by hand.
+- **Spec approval is human.** Only a person runs `harness approve`.
+- **Do not close a feature without green tests.** The `done` transition enforces it.
+- **Document what you do** in `.harness/progress/current.md` while working.
+- **Declare every shortcut** in `.harness/state/techdebt_list.json` the moment you
+  take it. An undeclared shortcut is a rejection.
+- **If you don't know something, look in `.harness/docs/`** before inventing it.
 
-## 4. Workflow (SDD)
+## 4. Workflow
+
+`harness next` drives the flow. In outline:
 
 ```
-pending → [spec_author] → spec_ready → ⏸ HUMAN → in_progress → [implementer → reviewer] → done
+sdd: true    pending → [spec_author] → spec_ready → ⏸ human approve → in_progress
+sdd: false   pending → in_progress
+both         in_progress → [implementer → reviewer] → done
 ```
 
-1. The leader detects the first `pending` feature with `"sdd": true`.
-2. The leader launches `spec_author`, which creates
-   `specs/<name>/{requirements,design,tasks}.md` and marks the status as
-   `spec_ready`.
-3. **Pause.** The human reads the spec in `specs/<name>/` and approves (or requests changes).
-4. Once approved, the leader changes the status to `in_progress` and launches `implementer`.
-5. The implementer executes `tasks.md` one by one, marking them `[x]`.
-6. The reviewer verifies traceability `R<n>` ↔ test and complete tasks;
-   approves or rejects.
-7. If approved, the implementer marks `done` and moves the summary to
-   `progress/history.md`.
+`CHANGES_REQUESTED` keeps the feature `in_progress` and loops implementer →
+reviewer until `APPROVED`. The leader then runs `harness transition <name> done`.
 
-## 5. Session Closure (Lifecycle)
+## 5. Session Closure
 
-Before finishing:
-
-1. Run `./init.sh` — all green.
-2. If the task is finished: mark `status: "done"` in `feature_list.json`.
-   Confirm no debt with `severity: "critical"` is left `open` in
-   `techdebt_list.json`; if there is, the session does not close.
-3. Move the summary from `progress/current.md` to the end of `progress/history.md`.
-4. Empty `progress/current.md` leaving only the template.
-5. Do not leave temporary files, debug `print()` statements, or contextless TODOs.
+1. Run `.harness/bin/harness check`: it must pass.
+2. Confirm no `critical` debt is `open`; if there is, the session does not close.
+3. Move the summary from `.harness/progress/current.md` to the end of
+   `.harness/progress/history.md`.
+4. Reset `current.md` from `.harness/templates/progress_current.md`.
+5. Do not leave temporary files, debug output, or contextless TODOs.
 
 ## 6. If You Get Stuck
 
-- Reread the relevant section of `docs/`.
-- If the tool does not do what you expect, **do not invent a workaround**:
-  document the blocker in `progress/current.md` and stop the session.
+- Reread the relevant file in `.harness/docs/`.
+- If a tool does not do what you expect, or the hook blocks you, **do not invent a
+  workaround**: document the blocker in `.harness/progress/current.md` and stop.

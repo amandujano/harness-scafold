@@ -1,0 +1,9 @@
+{
+  "description": "Any other stack: no scaffold, you set the commands in .harness/config.json",
+  "requires": [],
+  "scaffold": [],
+  "commands": {},
+  "no_tests": {},
+  "gitignore": [],
+  "generated": []
+}

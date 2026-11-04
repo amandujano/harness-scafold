@@ -1,0 +1,42 @@
+{
+  "description": "Go module (standard testing package)",
+  "requires": [
+    [
+      "go"
+    ]
+  ],
+  "scaffold": [
+    {
+      "run": [
+        "go",
+        "mod",
+        "init",
+        "{{name}}"
+      ],
+      "cwd": "src"
+    }
+  ],
+  "commands": {
+    "test": "go test ./...",
+    "build": "go build ./...",
+    "lint": "go vet ./..."
+  },
+  "no_tests": {
+    "patterns": [
+      "\\[no test files\\]"
+    ],
+    "unless": [
+      "^ok\\s",
+      "^FAIL"
+    ],
+    "exit_codes": []
+  },
+  "gitignore": [
+    "src/bin/",
+    "src/coverage.out"
+  ],
+  "generated": [
+    "bin",
+    "coverage.out"
+  ]
+}

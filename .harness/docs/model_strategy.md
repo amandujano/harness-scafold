@@ -1,19 +1,25 @@
 # Model Strategy — Mixing Models Without Losing Quality
 
 > Which model each agent runs on, why, and how to know when the mix is wrong.
-> Prices verified 2026-09-06. Re-verify before acting on them; they move.
+> **The prices below are unverified.** They date from 2026-09-06 and describe the
+> previous model family. Recheck them before relying on any cost figure here.
 
 ---
 
 ## 1. Start With the Real Numbers
 
-| Model | ID | Context | Input $/1M | Output $/1M |
-|---|---|---|---|---|
-| Claude Opus 5 | `claude-opus-5` | 1M | $5.00 | $25.00 |
-| Claude Sonnet 5 | `claude-sonnet-5` | 1M | $2.00 | $10.00 |
-| Claude Haiku 4.5 | `claude-haiku-4-5` | **200K** | $1.00 | $5.00 |
+Current family: Opus 5.5 (`claude-opus-5-5`), Sonnet 5.5 (`claude-sonnet-5-5`) and
+Haiku 5.5 (`claude-haiku-5-5`). Their prices and context windows have not been
+verified here. The last recorded figures, for the previous family:
 
-The ratio is **5 : 2 : 1**, identical on input and output.
+| Previous model | Context | Input $/1M | Output $/1M |
+|---|---|---|---|
+| Claude Opus 5 | 1M | $5.00 | $25.00 |
+| Claude Sonnet 5 | 1M | $2.00 | $10.00 |
+| Claude Haiku 4.5 | **200K** | $1.00 | $5.00 |
+
+The reasoning below uses those figures: a **5 : 2 : 1** ratio, identical on input
+and output. Recheck it against current pricing.
 
 Two consequences that contradict the usual intuition:
 
@@ -47,17 +53,14 @@ flowchart TB
 **Lever 1 — remove entropy.** A cheaper model is not a dumber model on an easier
 task. If `tasks.md` names the file, the signature, and the covered `R<n>`, the
 implementer is transcribing a decision, not making one — and Sonnet is genuinely
-sufficient. This is what the ontology work in `ontology_overview.md` buys you:
+sufficient. This is what the ontology work in `.harness/docs/ontology_overview.md` buys you:
 every deterministic decision moved out of the LLM lowers the intelligence floor
 the whole pipeline needs.
 
-**Lever 2 — effort.** On Opus 5 and Sonnet 5, `output_config.effort` runs `low`
-through `max`. Lower effort on a strong model frequently beats high effort on a
-weaker one, and it keeps you on one model. Two caveats specific to this harness:
-Haiku 4.5 does not accept `effort` at all, and **Claude Code subagent frontmatter
-exposes `model:` but not `effort:`** — so inside this repo, lever 2 is only
-available if you drive the API directly. Inside Claude Code, lever 3 is the lever
-you actually have.
+**Lever 2 — effort.** Lower effort on a strong model frequently beats high effort
+on a weaker one, and it keeps you on one model. Claude Code subagent frontmatter
+accepts `effort:` with `low`, `medium`, `high`, `xhigh` or `max`, so this lever is
+available per role in `.claude/agents/`. Check that the role's model supports it.
 
 **Lever 3 — the model mix.** Below.
 
@@ -65,7 +68,7 @@ you actually have.
 
 ## 3. Pin One Model Per Role
 
-Prompt caches are **model-scoped**. A role that re-reads `AGENTS.md`, `docs/`,
+Prompt caches are **model-scoped**. A role that re-reads `.harness/AGENTS.md`, `.harness/docs/`,
 and the spec on every invocation builds a cacheable prefix — but only while that
 role stays on one model. Flipping a role between models by feature complexity
 halves that role's hit rate and can cost more than the downgrade saves.
@@ -97,7 +100,7 @@ The target table below is the destination, not the current repo state.
 | `leader` | **Opus** | Decomposition errors propagate into every downstream agent. Its context is kept thin by the anti-broken-telephone rule (subagents return file references, not content), so it is cheaper to run than it looks. |
 | `spec_author` | **Opus** | Highest ROI per token in the pipeline. A spec is a few thousand tokens; an error in it is paid three times — implementation, review, rework — at the *expensive* model. Never economize here. |
 | `implementer` | **Sonnet** | Executes an approved `tasks.md`: files named, signatures decided, alternatives already discarded. Low entropy by construction. It is also the dominant cost center (output-heavy), so this is where the 60% actually lands. Conditional on the spec being good — see §5. |
-| `reviewer` | **Sonnet** | Traceability and checkbox completion are mechanical (and should migrate to the ontology validator). What remains is judging whether a test is *meaningful*. Never below the implementer — see the rule below. |
+| `reviewer` | **Sonnet** | Traceability and checkbox completion are mechanical and already run in `harness check`. What remains is judging whether a test is *meaningful*. Never below the implementer — see the rule below. |
 | explorers | **Haiku** | High read volume, low reasoning, returns a summary. Watch the 200K ceiling: an explorer sweeping a large repo will hit it. Scope each explorer to a narrow question. |
 
 ### The rule that protects quality
@@ -106,7 +109,7 @@ The target table below is the destination, not the current repo state.
 
 A reviewer weaker than the agent it audits does not review — it rubber-stamps.
 It will not catch the shortcut, so the shortcut never reaches
-`techdebt_list.json`, so your debt ledger reads clean while the codebase rots.
+`.harness/state/techdebt_list.json`, so your debt ledger reads clean while the codebase rots.
 This is the single worst trade available in a multi-agent harness, and it is also
 the most tempting, because the reviewer looks like a cheap formality.
 
@@ -125,7 +128,7 @@ or three times, usually at the higher tier anyway. Escalate when these fire:
 | Feature is `Complex (refactor)` in the leader's effort table | Implementer -> Opus from the start |
 | Feature touches a security, persistence, or migration boundary | Implementer -> Opus; no exceptions |
 | A `critical` debt is being paid | Implementer -> Opus |
-| `spec_author` returns `blocked` twice on the same feature | The feature is under-specified — fix `acceptance` in `feature_list.json`, do not escalate |
+| `spec_author` returns `blocked` twice on the same feature | The feature is under-specified — fix `acceptance` in `.harness/state/feature_list.json`, do not escalate |
 
 Note the last row. When the same agent fails repeatedly, a bigger model is
 usually the wrong answer; the input is bad. Escalating there buys a more
@@ -138,7 +141,7 @@ expensive, more confident wrong answer.
 This is the part most model-mixing strategies leave out, and without it the
 whole thing is faith.
 
-**`techdebt_list.json` is the instrument.** Because the implementer must declare
+**`.harness/state/techdebt_list.json` is the instrument.** Because the implementer must declare
 every shortcut, and the reviewer rejects undeclared ones, the ledger measures
 something real: how often the cheap model chose the cheap path.
 
@@ -171,7 +174,7 @@ cheaper implementer that triggers one extra review cycle is not cheaper.
 
 ## 8. Applying It
 
-Claude Code subagents take the model in frontmatter:
+Claude Code subagents take the model, and optionally the effort, in frontmatter:
 
 ```yaml
 ---

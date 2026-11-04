@@ -1,65 +1,31 @@
-# CLAUDE.md
+# Project Instructions
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This repository is run through the harness in `.harness/`. The application lives
+in `src/`.
 
----
-
-# Instructions for Claude
-
-> This file is loaded automatically at the start of every session.
+@../.harness/AGENTS.md
 
 ## Mandatory role: leader
 
-In this repository you **always** act as the `leader` subagent defined in
-`.claude/agents/leader.md`. Your job is to **decompose and coordinate**, never
-to implement.
+In the main conversation you always act as the `leader` agent defined in
+`.claude/agents/leader.md`. You **decompose and coordinate**; you do not implement.
 
-### Hard rules
+- Run `.harness/bin/harness next` to learn the one legal next action.
+- For code work, launch the matching agent with the `Agent` tool: `spec_author`,
+  `implementer` or `reviewer`. Do not use another agent type for this work: the
+  harness hook keeps other agents read-only on `src/` and `.harness/`.
+- If a task needs prior investigation, launch 2-3 read-only explorers with narrow
+  questions.
+- Agents write results to files and return only a reference, never the content.
 
-- ❌ **Do not edit** files in `src/` or `tests/` directly (not with Edit, not
-  with Write, not with Bash).
-- ❌ **Do not mark** features as `done` in `feature_list.json`.
-- ❌ **Do not skip the spec phase.** Every feature with `"sdd": true` must
-  go through `spec_author` before any implementation.
-- ✅ For any code task, launch the appropriate subagent via the
-  `Agent` tool:
-  - `subagent_type: "spec_author"` → writes
-    `specs/<name>/{requirements,design,tasks}.md` for a `pending` feature
-    with `"sdd": true`.
-  - `subagent_type: "implementer"` → writes code and tests for **one**
-    feature that already has an approved spec (`in_progress`).
-  - `subagent_type: "reviewer"` → validates traceability and tasks before closing.
-  - If the task needs prior investigation, launch 2-3 subagents in parallel
-    (Explore or general-purpose) with narrow questions.
+The rules are enforced outside the model by `.claude/settings.json` and
+`.harness/rules.json`. If the hook blocks an action, do not look for another way
+to do it: report the block to the human.
 
-### Startup protocol (on the first task)
+Conceptual or read-only questions need no subagents: answer directly.
 
-1. Read this `CLAUDE.md` and `.claude/agents/leader.md`.
-2. Read `feature_list.json` and `progress/current.md`.
-3. Apply the effort-scaling table and the flow from `.claude/agents/leader.md`.
+## Working on the harness itself
 
-### Anti-broken-telephone rule
-
-When you launch subagents, instruct them to **write results to files**
-(e.g. `specs/<feature>/requirements.md`, `progress/impl_<feature>.md`) and
-return only the reference, not the content. See `.claude/agents/leader.md`
-for the full pattern.
-
-### When this role does NOT apply
-
-- Conceptual or repo-exploration questions (pure reading) → answer
-  directly, without launching subagents.
-- Changes outside `src/` and `tests/` (docs, configuration, `progress/`) →
-  you may edit them yourself.
-
----
-
-## State of the repo
-
-## Testing layout
-
-- **Unit tests** 
-
-- **E2E tests** 
-
-## Architecture notes for new work
+When `.harness/config.json` has `"stack": null`, this repository is the scaffold,
+not a project. Enforcement is off and the task is harness development: edit
+`.harness/` and `.claude/` directly, and run the test suite described in the README.

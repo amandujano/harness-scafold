@@ -1,60 +1,22 @@
 .atl
-
-# ==========================================
-# Dependencies
-# ==========================================
-node_modules/
-.pnp
-.pnp.js
-
-# ==========================================
-# TypeScript & Build Outputs
-# ==========================================
-# Ignore the main build/distribution directories
-dist/
-build/
-lib/
-out/
-
-# Ignore TypeScript build cache metadata
-*.tsbuildinfo
-
-# Optional: Ignore compiled JS files ONLY if they are generated next to TS source files.
-# Un-comment the next lines if you compile your .ts to .js in the same source folder.
-# src/**/*.js
-# src/**/*.js.map
-# src/**/*.d.ts
-
-# ==========================================
-# Testing & Code Coverage
-# ==========================================
-coverage/
-.nyc_output/
+.codegraph/
+__pycache__/
 *.log
 
-# ==========================================
-# Environment Variables & Secrets
-# ==========================================
+# Environment and secrets
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
 
-# ==========================================
-# IDEs and System Files
-# ==========================================
-# macOS
+# Claude Code personal settings
+.claude/settings.local.json
+
+# Operating system
 .DS_Store
-
-# Windows
 Thumbs.db
 
-# JetBrains (WebStorm, IntelliJ)
+# Editors
 .idea/
 *.iml
-
-# VS Code
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "states": ["pending", "spec_ready", "in_progress", "done", "blocked"],
+  "initial_state": "pending",
+  "agents": ["leader", "spec_author", "implementer", "reviewer"],
+  "transitions": [
+    {
+      "from": ["pending"],
+      "to": "spec_ready",
+      "actor": "spec_author",
+      "when": { "sdd": true },
+      "guards": ["spec_files_exist", "spec_shape"]
+    },
+    {
+      "from": ["spec_ready"],
+      "to": "in_progress",
+      "actor": "leader",
+      "when": { "sdd": true },
+      "guards": ["spec_files_exist", "spec_shape", "valid_approval", "no_other_in_progress"]
+    },
+    {
+      "from": ["pending"],
+      "to": "in_progress",
+      "actor": "leader",
+      "when": { "sdd": false },
+      "guards": ["no_other_in_progress"]
+    },
+    {
+      "from": ["in_progress"],
+      "to": "done",
+      "actor": "leader",
+      "guards": ["review_approved", "tasks_complete", "traceability", "check_green"]
+    },
+    {
+      "from": ["pending", "spec_ready", "in_progress"],
+      "to": "blocked",
+      "actor": "any_agent",
+      "guards": ["reason_given"]
+    },
+    {
+      "from": ["blocked"],
+      "to": "@previous",
+      "actor": "human",
+      "guards": ["no_other_in_progress_on_resume"]
+    }
+  ],
+  "roles": {
+    "leader": {
+      "allow": [
+        ".harness/state/feature_list.json",
+        ".harness/state/techdebt_list.json",
+        ".harness/progress/**",
+        ".harness/docs/**",
+        "*.md"
+      ],
+      "deny": [".harness/progress/impl_*", ".harness/progress/review_*"]
+    },
+    "spec_author": {
+      "allow": [
+        ".harness/specs/**",
+        ".harness/progress/spec_*",
+        ".harness/state/techdebt_list.json"
+      ]
+    },
+    "implementer": {
+      "allow": [
+        "src/**",
+        ".harness/specs/{active}/tasks.md",
+        ".harness/progress/**",
+        ".harness/state/techdebt_list.json"
+      ],
+      "deny": [".harness/progress/review_*"],
+      "generated_paths": true
+    },
+    "reviewer": {
+      "allow": [".harness/progress/review_*"]
+    }
+  },
+  "protected": ["src/**", ".harness/**", ".claude/**", ".git/**"],
+  "unknown_role_allow": ["*.txt", "tmp/**"],
+  "debt": {
+    "statuses": ["open", "accepted", "scheduled", "in_progress", "resolved", "wontfix"],
+    "severities": ["low", "medium", "high", "critical"],
+    "kinds": [
+      "shortcut",
+      "missing_test",
+      "spec_deviation",
+      "architecture_violation",
+      "duplication",
+      "unverified_assumption",
+      "tooling",
+      "documentation"
+    ],
+    "append_only_roles": ["spec_author", "implementer"]
+  },
+  "required_files": [
+    ".claude/CLAUDE.md",
+    ".claude/settings.json",
+    ".claude/agents/leader.md",
+    ".claude/agents/spec_author.md",
+    ".claude/agents/implementer.md",
+    ".claude/agents/reviewer.md",
+    ".harness/AGENTS.md",
+    ".harness/CHECKPOINTS.md",
+    ".harness/state/feature_list.json",
+    ".harness/state/techdebt_list.json",
+    ".harness/progress/current.md",
+    ".harness/progress/history.md",
+    ".harness/docs/architecture.md",
+    ".harness/docs/conventions.md",
+    ".harness/docs/specs.md",
+    ".harness/docs/verification.md",
+    ".harness/docs/stack/conventions.md",
+    ".harness/docs/stack/testing.md"
+  ],
+  "invariants": [
+    { "id": "hook_wired", "checkpoint": "C1", "description": ".claude/settings.json runs the harness PreToolUse hook" },
+    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature is in_progress" },
+    { "id": "spec_files_present", "checkpoint": "C6", "description": "Every sdd feature past pending has its three spec files" },
+    { "id": "spec_shape_valid", "checkpoint": "C6", "description": "Every sdd feature past pending has R<n> headings and tasks that reference them" },
+    { "id": "approval_valid", "checkpoint": "C6", "description": "Every sdd feature in in_progress or done has an approval matching its current spec" },
+    { "id": "done_tasks_complete", "checkpoint": "C6", "description": "Every done sdd feature has all tasks checked" },
+    { "id": "done_traceability", "checkpoint": "C6", "description": "Every R<n> of a done sdd feature maps to a test name that occurs in the application" },
+    { "id": "done_review_approved", "checkpoint": "C2", "description": "Every done feature has an implementation report and a current APPROVED review" },
+    { "id": "no_open_critical_debt", "checkpoint": "C7", "description": "No critical debt is open" },
+    { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every scheduled sdd debt has a matching feature that is not done" }
+  ]
+}

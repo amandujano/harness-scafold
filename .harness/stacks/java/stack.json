@@ -1,0 +1,51 @@
+{
+  "description": "Java application (Maven quickstart, JUnit)",
+  "requires": [
+    [
+      "mvn"
+    ],
+    [
+      "java"
+    ]
+  ],
+  "scaffold": [
+    {
+      "run": [
+        "mvn",
+        "-B",
+        "archetype:generate",
+        "-DarchetypeGroupId=org.apache.maven.archetypes",
+        "-DarchetypeArtifactId=maven-archetype-quickstart",
+        "-DarchetypeVersion=1.5",
+        "-DgroupId=com.example",
+        "-DartifactId={{name}}",
+        "-Dversion=0.1.0-SNAPSHOT",
+        "-DinteractiveMode=false"
+      ],
+      "cwd": "stage",
+      "hoist": "{{name}}"
+    }
+  ],
+  "commands": {
+    "test": "mvn -B test",
+    "build": "mvn -B package",
+    "lint": "mvn -B verify -DskipTests"
+  },
+  "no_tests": {
+    "patterns": [
+      "No tests to run",
+      "There are no tests to run",
+      "Tests run: 0,"
+    ],
+    "unless": [
+      "Tests run: [1-9]"
+    ],
+    "exit_codes": []
+  },
+  "gitignore": [
+    "src/target/"
+  ],
+  "generated": [
+    "target"
+  ]
+}

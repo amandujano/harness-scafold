@@ -1,75 +1,69 @@
 # CHECKPOINTS — Final State Evaluation
 
 > In multi-agent systems, the path is not evaluated; the destination is.
-> These are the objective checkpoints that a judge (human or AI) can use
-> to decide if the project is healthy.
+>
+> **[auto]** items are enforced by `.harness/bin/harness check`: a passing check
+> proves them, so do not re-judge them. The remaining items need judgment.
 
 ## C1 — The Harness is Complete
 
-- [ ] The 4 base files exist: `AGENTS.md`, `init.sh`, `feature_list.json`,
-      `progress/current.md`.
-- [ ] The 3 docs exist: `docs/architecture.md`, `docs/conventions.md`,
-      `docs/verification.md`.
-- [ ] `./init.sh` finishes with exit code 0.
+- [ ] **[auto]** Every file in `required_files` of `.harness/rules.json` exists.
+- [ ] **[auto]** `.claude/settings.json` runs the harness hook.
+- [ ] **[auto]** `.harness/bin/harness check` exits 0.
 
 ## C2 — State is Consistent
 
-- [ ] At most one feature is `in_progress` in `feature_list.json`.
-- [ ] Every `done` feature has associated tests that pass.
-- [ ] `progress/current.md` is empty or describes the active session
-      (contains no clutter from previous sessions).
+- [ ] **[auto]** State files are valid and use only known statuses.
+- [ ] **[auto]** At most one feature is `in_progress`.
+- [ ] **[auto]** Every `done` feature has an implementation report and a current
+      APPROVED review.
+- [ ] `.harness/progress/current.md` is empty or describes the active session.
 
 ## C3 — Code Respects Architecture
 
-- [ ] `src/` only contains modules planned in `docs/architecture.md`.
-- [ ] No external dependencies in `requirements.txt` (must be empty
-      or not exist).
-- [ ] No loose `print()` statements for debug, nor contextless TODOs.
+- [ ] `src/` only contains what `.harness/docs/architecture.md` and the specs plan.
+- [ ] New dependencies are justified in the feature's spec.
+- [ ] No debug output or contextless TODOs.
 
 ## C4 — Verification is Real
 
-- [ ] `tests/` has at least one test per module in `src/`.
-- [ ] Tests use `tempfile.TemporaryDirectory()`, not fs mocks.
-- [ ] run commant to execute tests and it must shows that all tests passed
+- [ ] **[auto]** `commands.test` is configured and passes.
+- [ ] **[auto]** When a feature is `done`, the test command finds tests.
+- [ ] Tests follow `.harness/docs/stack/testing.md` and assert concrete results.
 
 ## C5 — Session Closed Correctly
 
-- [ ] No suspicious untracked files (`*.tmp`, outside of `.gitignore`).
-- [ ] `progress/history.md` has an entry for the last session.
-- [ ] The last worked-on feature is reflected in its correct state.
+- [ ] No suspicious untracked files.
+- [ ] `.harness/progress/history.md` has an entry for the last session.
 
 ## C6 — Spec Driven Development
 
-- [ ] Every feature with `"sdd": true` in state `spec_ready`, `in_progress`,
-      or `done` has its folder `specs/<name>/` with the 3 files:
-      `requirements.md`, `design.md`, `tasks.md`.
-- [ ] `requirements.md` uses strict EARS (see `docs/specs.md`).
-- [ ] Every `done` feature with `"sdd": true` has all its tasks marked
-      `[x]` in `tasks.md`.
-- [ ] Each `R<n>` from `requirements.md` is covered by at least one concrete
-      test in `tests/`.
+- [ ] **[auto]** Every `sdd: true` feature past `pending` has its 3 spec files, with
+      `R<n>` headings and tasks that reference them.
+- [ ] **[auto]** Every `sdd: true` feature in `in_progress` or `done` has an approval
+      that matches its current spec.
+- [ ] **[auto]** Every `done` `sdd: true` feature has all tasks `[x]`.
+- [ ] **[auto]** Every `R<n>` of a `done` feature maps to a test name that occurs in
+      `src/`.
+- [ ] Each mapped test really verifies its `R<n>`.
+- [ ] `requirements.md` uses strict EARS (see `.harness/docs/specs.md`).
 
 ## C7 — Technical Debt is Declared, Not Hidden
 
-- [ ] `techdebt_list.json` exists and is valid JSON.
-- [ ] Every debt entry has a non-empty `acceptance` array whose items are
-      verifiable — the same bar as a feature.
-- [ ] Every debt entry has an `origin` naming the agent, feature and session
-      that produced it.
-- [ ] No debt with `severity: "critical"` is left in status `open`.
+- [ ] **[auto]** Every debt has verifiable fields: non-empty `acceptance`, and an
+      `origin` naming agent, feature and session.
+- [ ] **[auto]** No `critical` debt is `open`.
+- [ ] **[auto]** Every `scheduled` debt with `sdd: true` has a feature with the same
+      `name` that is not `done`.
+- [ ] Every `acceptance` item is genuinely verifiable.
 - [ ] Every shortcut visible in the session's diff has a matching entry. A clean
-      ledger next to a diff full of compromises is a **failing** checkpoint, not
-      a passing one.
-- [ ] Every debt in status `scheduled` with `"sdd": true` has a corresponding
-      `pending` feature in `feature_list.json`.
+      ledger next to a diff full of compromises is a **failing** checkpoint.
 
 ---
 
-**How to use this file:** a reviewer agent (`.claude/agents/reviewer.md`)
-goes through each checkbox, marks `[x]` or `[ ]`, and rejects the session closure
-if any boxes in C1-C7 remain empty.
+**How to use this file:** the reviewer goes through the items that need judgment
+and rejects the work if any fails.
 
 > **On C7:** an empty debt ledger is only credible when the diff is genuinely
-> clean. The purpose of the ledger is to make compromises *visible*, so a
-> reviewer that never finds debt is either reviewing perfect work or not
+> clean. A reviewer that never finds debt is either reviewing perfect work or not
 > reviewing at all.

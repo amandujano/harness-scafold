@@ -1,0 +1,10 @@
+{
+  "project": "{{project}}",
+  "stack": "{{stack}}",
+  "app_dir": "src",
+  "commands": {
+    "test": "",
+    "build": "",
+    "lint": ""
+  }
+}

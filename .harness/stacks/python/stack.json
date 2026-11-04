@@ -1,0 +1,39 @@
+{
+  "description": "Python package (pyproject, standard library unittest)",
+  "requires": [
+    [
+      "python3"
+    ]
+  ],
+  "scaffold": [],
+  "commands": {
+    "test": "python3 -m unittest discover -s tests -t . -v",
+    "build": "",
+    "lint": ""
+  },
+  "no_tests": {
+    "patterns": [
+      "Ran 0 tests",
+      "NO TESTS RAN"
+    ],
+    "unless": [
+      "Ran [1-9][0-9]* test"
+    ],
+    "exit_codes": [
+      5
+    ]
+  },
+  "gitignore": [
+    "src/.venv/",
+    "src/dist/",
+    "src/*.egg-info/"
+  ],
+  "generated": [
+    "__pycache__",
+    ".pytest_cache",
+    "build",
+    "dist",
+    ".venv",
+    ".coverage"
+  ]
+}

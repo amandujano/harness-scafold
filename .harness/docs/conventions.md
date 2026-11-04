@@ -1,23 +1,21 @@
 # Code Conventions
 
-> Extreme homogeneity. AI predicts better when the repository looks
-> the same everywhere.
+> Extreme homogeneity. AI predicts better when the repository looks the same
+> everywhere. Language-specific rules are in `.harness/docs/stack/conventions.md`.
 
-## Python Style (change to another language)
+## Structure
 
-## File Structure
+- The whole application lives in `src/`. Do not put application files elsewhere.
+- Follow the framework's normal layout inside `src/`.
 
 ## Tests
 
-- One test file per module: `tests/test_<module>`.
-- One `Test<Thing>(unittest.TestCase)` class per logical unit.
-- Each test uses a `tempfile.TemporaryDirectory()` and cleans up after itself.
-- Descriptive test names: `test_load_returns_empty_when_file_missing`.
-
-## Error Handling
+- Test layout and commands are in `.harness/docs/stack/testing.md`.
+- Use descriptive test names that state the behavior and the condition.
+- Each test cleans up after itself.
 
 ## Comments
 
 By default, they are **not** written. They are only allowed when explaining a
-non-obvious *why* (e.g., documented workaround, subtle invariant). Names should
-do the rest.
+non-obvious *why* (a documented workaround, a subtle invariant). Names should do
+the rest.

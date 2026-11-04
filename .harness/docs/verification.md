@@ -1,54 +1,61 @@
 # Verification — How to Prove the Work Functions
 
-> Golden Rule: **the agent does not say "it works," they prove it**.
-> Every feature ends with executable evidence, not claims.
+> Golden Rule: **the agent does not say "it works," they prove it**. Every feature
+> ends with executable evidence, not claims.
 
 ## Verification Levels
 
-### Level 1 — Unit Tests (Mandatory)
+### Level 1 — Automated Tests (Mandatory)
 
-Every public function in `src/` must have at least one test in `tests/` that:
+Every public unit in `src/` has at least one test that:
 
 1. Covers the happy path.
-2. Covers at least one error path if the function can fail.
+2. Covers at least one error path if the unit can fail.
 
-Command:
+Run them with `commands.test` from `.harness/config.json`, or through:
+
 ```bash
-use language/framework test executiion command
+.harness/bin/harness check
 ```
+
+Test layout is in `.harness/docs/stack/testing.md`.
 
 ### Level 2 — Manual Smoke Test (Optional but Recommended)
 
-Before closing the session, execute an end-to-end flow with a temporary file
-in `/tmp`:
+Before closing the session, run one end-to-end flow by hand and record the result
+in `.harness/progress/current.md`.
 
-### Level 3 — Requirements Traceability (Mandatory for features with `"sdd": true`)
+### Level 3 — Requirements Traceability (Mandatory for `"sdd": true`)
 
-Each `R<n>` from `specs/<name>/requirements.md` must be mappable to at
-least one concrete test in `tests/`. The reviewer rejects if coverage is missing.
-
-The implementer documents the map in `progress/impl_<name>.md`:
+Each `R<n>` must map to at least one concrete test. The implementer documents the
+map in `.harness/progress/impl_<name>.md`, one line per requirement, in this exact
+form because `harness` reads it:
 
 ```markdown
 ## Traceability
-- R1 → `test_recent_default_limit`
-- R2 → `test_recent_invalid_limit`
-- R3 → `test_recent_custom_limit`
+- R1 → `<test name>`
+- R2 → `<test name>`
 ```
 
-## Anti-patterns (Do not do)
+`harness check` requires each mapped name to occur in `src/`.
+
+For `"sdd": false`, the same report maps each `acceptance` item to a test, and the
+reviewer verifies those. The report is required for every feature.
+
+A feature closes only on evidence: an implementation report, and a review whose
+latest verdict is `APPROVED` and which is not older than that report. Who may write
+each report is in `.harness/rules.json`.
+
+## Anti-patterns
 
 - ❌ "I added the command, it should work." → missing executable test.
-- ❌ Test that only verifies the function doesn't raise an exception. → it must
-  check the concrete result.
-- ❌ Filesystem `mock`. → use a real `tempfile.TemporaryDirectory()`.
-- ❌ Marking the feature as `done` without passing `./init.sh`.
+- ❌ A test that only verifies nothing was thrown. → check the concrete result.
+- ❌ Mocking what could be exercised for real, such as the filesystem in a temp
+  directory.
+- ❌ Working around a failing guard. → fix the cause or stop.
 
-## Final Verification Before Closing
+## Final Verification
 
-```bash
-./init.sh           # must finish with [OK] Environment ready
-```
-
-If `./init.sh` is red, **do not** mark anything as `done`. Note the blocker
-in `progress/current.md` with status `blocked` in `feature_list.json`.
+`.harness/bin/harness transition <name> done` runs the whole check and refuses to
+close the feature if anything fails. If it is red, record the blocker in
+`.harness/progress/current.md`.

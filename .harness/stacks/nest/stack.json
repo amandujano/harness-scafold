@@ -1,0 +1,65 @@
+{
+  "description": "NestJS application (TypeScript, Jest, npm)",
+  "requires": [
+    [
+      "nest",
+      "npx"
+    ],
+    [
+      "npm"
+    ]
+  ],
+  "scaffold": [
+    {
+      "run": [
+        "nest",
+        "new",
+        "{{name}}",
+        "--directory",
+        "src",
+        "--skip-git",
+        "--package-manager",
+        "npm"
+      ],
+      "fallback": [
+        "npx",
+        "--yes",
+        "@nestjs/cli@11",
+        "new",
+        "{{name}}",
+        "--directory",
+        "src",
+        "--skip-git",
+        "--package-manager",
+        "npm"
+      ],
+      "cwd": "stage"
+    }
+  ],
+  "commands": {
+    "test": "npm test",
+    "build": "npm run build",
+    "lint": "npm run lint"
+  },
+  "no_tests": {
+    "patterns": [
+      "^No tests found, exiting with code 1"
+    ],
+    "unless": [
+      "^Tests:\\s+[0-9]+ "
+    ],
+    "exit_codes": [
+      1
+    ]
+  },
+  "gitignore": [
+    "src/node_modules/",
+    "src/dist/",
+    "src/coverage/"
+  ],
+  "generated": [
+    "node_modules",
+    "dist",
+    "coverage"
+  ]
+}
