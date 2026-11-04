@@ -90,6 +90,8 @@ Append to the `debts` array in `.harness/state/techdebt_list.json`:
 
 Rules:
 
+- **`acceptance` must not require editing a closed report.** Reports of closed work are
+  hashed evidence; the payment is recorded in `impl_debt-<name>.md`.
 - **`acceptance` is not optional and is not prose.** Same bar as a feature: if it
   is not verifiable, it is not an acceptance criterion.
 - **`severity: "critical"`** is for debt that can lose data, break a security

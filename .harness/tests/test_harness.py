@@ -887,6 +887,35 @@ class HumanGateTests(ProjectCase):
         self.assertTrue(record["approved_at"])
 
 
+class EvidenceRestampTests(ProjectCase):
+    def closed(self):
+        self.make_done_ready()
+        self.set_features(feature(status="in_progress"))
+        self.assertEqual(self.run_cli("transition", "alpha", "done").returncode, 0)
+        self.write(".harness/progress/impl_alpha.md", self.path(".harness/progress/impl_alpha.md").read_text() + "x\n")
+        self.assertNotEqual(self.run_cli("check", "--no-tests").returncode, 0)
+
+    def test_changed_closed_report_fails_until_a_human_restamps_it(self):
+        self.closed()
+        code = self.run_at_terminal("evidence", "restamp", "alpha", "--reason", "paid debt")
+        self.assertEqual(code.returncode, 0, code.stdout)
+        self.assertEqual(self.run_cli("check", "--no-tests").returncode, 0)
+
+    def test_restamp_keeps_an_audit_entry(self):
+        self.closed()
+        before = self.read_json(FEATURES)["features"][0]["evidence"]
+        self.run_at_terminal("evidence", "restamp", "alpha", "--reason", "paid debt")
+        entry = self.read_json(FEATURES)["features"][0]["evidence_history"][0]
+        self.assertEqual((entry["reason"], entry["previous"]), ("paid debt", before))
+
+    def test_restamp_needs_a_terminal(self):
+        self.closed()
+        before = self.path(FEATURES).read_bytes()
+        result = self.run_cli("evidence", "restamp", "alpha", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.path(FEATURES).read_bytes(), before)
+
+
 class TraceParsingTests(unittest.TestCase):
     def parse(self, target):
         loader = importlib.machinery.SourceFileLoader("harness_cli", str(CLI))
@@ -2810,6 +2839,48 @@ class BashWriterTests(HookCase):
 
     def test_target_directory_forms_stay_allowed_for_the_owner(self):
         self.assert_allowed(self.bash("cp -t src/app /tmp/a.py", "implementer"))
+
+    def test_reports_of_closed_work_are_frozen_for_every_role(self):
+        self.set_features(feature(status="done"))
+        for path, role in ((".harness/progress/impl_alpha.md", "implementer"),
+                           (".harness/progress/review_alpha.md", "reviewer")):
+            with self.subTest(role=role):
+                self.assert_blocked(self.write_call(path, role, "changed"))
+
+    def test_reports_of_open_work_stay_writable(self):
+        self.set_features(feature(status="in_progress"))
+        self.assert_allowed(self.write_call(".harness/progress/impl_alpha.md", "implementer", "x"))
+
+    def test_a_debt_report_is_writable_while_its_feature_is_closed(self):
+        self.set_features(feature(status="done"))
+        self.assert_allowed(self.write_call(".harness/progress/impl_debt-alpha.md", "implementer", "x"))
+
+    def test_restamp_is_human_only(self):
+        for agent in ("leader", "implementer", "reviewer"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.bash("harness evidence restamp alpha --reason x", agent))
+
+    def test_agents_cannot_edit_the_evidence_history(self):
+        self.set_features(feature(status="done", evidence={"a": "b"}))
+        doc = self.read_json(FEATURES)
+        doc["features"][0]["evidence_history"] = []
+        self.assert_blocked(self.write_call(FEATURES, "leader", json.dumps(doc)))
+
+    def test_read_only_scripts_on_harness_files_pass(self):
+        for script in ("import json; print(json.load(open('.harness/state/feature_list.json')))",
+                       "print(open('.harness/progress/current.md','rb').read())",
+                       "print(open('.harness/progress/app.md').read())",
+                       "import sys; sys.stdout.write(open('.harness/rules.json').read())"):
+            with self.subTest(script=script):
+                self.assert_allowed(self.bash(f'python3 -c "{script}"', "leader"))
+
+    def test_scripted_writes_are_still_blocked(self):
+        for script in ("open('.harness/rules.json','w').write('x')", "open('.harness/rules.json',mode='a')",
+                       "import os; os.remove('.harness/rules.json')",
+                       "from pathlib import Path; Path('.harness/rules.json').write_text('x')",
+                       "import shutil; shutil.rmtree('.harness')"):
+            with self.subTest(script=script):
+                self.assert_blocked(self.bash(f'python3 -c "{script}"', "leader"))
 
     def test_heredoc_text_is_data_not_commands(self):
         review = ".harness/progress/review_alpha.md"

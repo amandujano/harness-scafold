@@ -22,6 +22,8 @@ Work through every item. Cite the file and line for each failure.
       any test notice?
 
 **Test quality**
+- [ ] To prove a test fails, break the code in a copy, never in `src/`: run
+      `cp -R src /tmp/review-<name>`, then edit and test there using absolute paths.
 - [ ] Assertions check concrete results, not merely that nothing threw.
 - [ ] The test exercises the real unit, not a mock of it.
 - [ ] Mocks stop at real boundaries such as network and clock.

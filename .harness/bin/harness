@@ -1390,6 +1390,27 @@ def cmd_approve(args):
     return 0
 
 
+def cmd_evidence_restamp(args):
+    ctx = load_context(find_root())
+    feature = get_feature(ctx, args.feature)
+    if feature["status"] != "done" or "evidence" not in feature:
+        raise HarnessError(f"feature {feature['name']} is not closed, so it has no evidence to restamp")
+    current = evidence_hashes(*report_paths(ctx, feature))
+    if current == feature["evidence"]:
+        raise HarnessError(f"evidence of {feature['name']} already matches its reports")
+    require_human(f"Accept the changed reports of {feature['name']} as its evidence")
+    feature.setdefault("evidence_history", []).append({
+        "by": approver_identity(),
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "reason": args.reason,
+        "previous": feature["evidence"],
+    })
+    feature["evidence"] = current
+    write_json(ctx.root / FEATURES, ctx.features_doc)
+    ok(f"evidence of {feature['name']} restamped")
+    return 0
+
+
 # --- PreToolUse hook --------------------------------------------------------
 
 
@@ -1438,9 +1459,26 @@ def allowed_patterns(rules, role, active):
     return patterns
 
 
-def write_denial(rules, role, active, rel):
+def closed_report(root, rel):
+    """Reports of closed work are hashed evidence: a later change belongs in a new report."""
+    report = re.fullmatch(r"\.harness/progress/(?:impl|review)_(.+)\.md", rel)
+    if report is None:
+        return False
+    try:
+        features = load_json(Path(root) / FEATURES).get("features", [])
+        debts = load_json(Path(root) / DEBTS).get("debts", [])
+    except (HarnessError, AttributeError):
+        return False
+    closed = {f.get("name", "").casefold() for f in features if f.get("status") == "done"}
+    closed |= {f"debt-{d.get('name', '')}".casefold() for d in debts if d.get("status") == "resolved"}
+    return report.group(1) in closed
+
+
+def write_denial(rules, role, active, rel, root):
     if rel is None:
         return None
+    if closed_report(root, rel):
+        return f"{rel} is evidence of closed work; record later changes in a new report"
     if role in rules["roles"]:
         if matches_glob(rules["roles"][role].get("deny", []), rel):
             return f"role {role} may not write {rel}"
@@ -1497,7 +1535,7 @@ def feature_list_denial(root, rules, current, proposed):
             return f"name of {name} is immutable once work exists; a human edits it directly"
         if feature.get("sdd") != after[key].get("sdd"):
             return f"sdd of {name} is immutable for agents; a human edits it directly"
-        for field in ("status", "blocked_from", "blocked_reason", "evidence"):
+        for field in ("status", "blocked_from", "blocked_reason", "evidence", "evidence_history"):
             if feature.get(field) != after[key].get(field):
                 return f"{field} of {name} changes only through `harness transition`"
     for key, feature in after.items():
@@ -1592,7 +1630,7 @@ def file_tool_denial(root, rules, role, payload):
     cwd = payload.get("cwd") or str(root)
     rel = relative_path(root, cwd, path)
     active = active_name(root)
-    denial = write_denial(rules, role, active, rel)
+    denial = write_denial(rules, role, active, rel, root)
     if denial or rel is None:
         return denial
     full = os.path.join(cwd, path)
@@ -1621,9 +1659,10 @@ INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun
 PTY_WRAPPERS = {"script", "expect", "unbuffer", "socat", "screen", "tmux", "ptyexec"}
 TEXT_ONLY_COMMANDS = {"echo", "printf", "grep", "egrep", "rg", "cat", "ls", "git", "gh", "head", "tail", "wc"}
 CLI_PATHS = (".harness/bin/harness", ".harness/bin", ".harness")
-SENSITIVE = (".harness/", ".claude/", "feature_list.json", "techdebt_list.json")
+SENSITIVE = (".harness", ".claude", "feature_list.json", "techdebt_list.json")
 WRITE_INTENT = re.compile(
-    r"open\([^)]*['\"][wax+]|\.write|write_text|writeFile|appendFile|dump\(|rename|unlink|remove|rmtree|"
+    r"open\([^)]*,\s*(mode\s*=\s*)?f?['\"][^'\"]*[wax+]|(?<!stdout)(?<!stderr)\.write\(|write_text|write_bytes|"
+    r"writeFile|appendFile|\bdump\(|\b(rename|replace|unlink|remove|rmdir|truncate)\(|rmtree|"
     r"shutil\.|copyFile|(^|\s)-\w*i\b")
 SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
@@ -1972,7 +2011,7 @@ def harness_call_denial(policy, argv):
     name = os.path.basename(argv[0])
     if runs_approve(argv, name):
         return "`harness approve` is human only"
-    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints", "sandbox"} & set(argv[1:]):
+    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints", "sandbox", "evidence"} & set(argv[1:]):
         return "the CLI cannot be run through an unresolved variable"
     call = harness_subcommand(argv)
     if not call:
@@ -2050,7 +2089,7 @@ class Policy:
         self.generated = [str(p).casefold() for p in config.get("generated_paths", [])]
 
     def write_denial(self, rel):
-        return write_denial(self.rules, self.role, self.active, rel)
+        return write_denial(self.rules, self.role, self.active, rel, self.root)
 
     def may_write_generated(self, rel):
         role = self.rules["roles"].get(self.role, {})
@@ -3135,6 +3174,14 @@ def build_parser():
 
     approve = command("approve", cmd_approve, "record human approval of a spec")
     approve.add_argument("feature")
+
+    evidence = command("evidence", None, "manage the evidence of closed features")
+    evidence_actions = evidence.add_subparsers(dest="evidence_action", required=True)
+    restamp = evidence_actions.add_parser("restamp", help="human: accept changed reports of a closed feature",
+                                          allow_abbrev=False)
+    restamp.set_defaults(handler=cmd_evidence_restamp)
+    restamp.add_argument("feature")
+    restamp.add_argument("--reason", required=True)
 
     sandbox = command("sandbox", cmd_sandbox, "run Claude Code under the project's nono sandbox")
     sandbox.add_argument("claude_args", nargs=argparse.REMAINDER)

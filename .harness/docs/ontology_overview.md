@@ -94,6 +94,9 @@ goes back to the reviewer.
 - **Evidence freshness.** While a feature is open, file times decide whether a review
   covers the latest report. Closing stores hashes of both reports, because file times
   do not survive a clone; from then on a mismatch always fails.
+- **Closed reports are frozen.** The hook denies writes to the reports of closed work;
+  later changes go in a new report. If a closed report must change, a human runs
+  `harness evidence restamp`, which keeps the previous hashes and the reason.
 - **Closing pays debt.** `transition <name> done` writes the feature and its scheduled
   debt of the same `name` as one step, and its guards evaluate that outcome.
 - **Approval binds content.** Approval stores spec hashes that ignore checkbox state,

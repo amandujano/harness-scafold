@@ -111,6 +111,7 @@ layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Ma
 | `harness update [--dry-run] [--force]` | Update harness-owned files from the scaffold |
 | `harness ci github [--force]` | Write the GitHub Actions workflow |
 | `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
+| `harness evidence restamp <feature> --reason <text>` | Human: accept changed reports of a closed feature, keeping an audit entry |
 | `harness approve <feature>` | Human approval: type the code shown on your terminal. Later spec edits invalidate it |
 
 To resume a blocked feature, run this in your own terminal:

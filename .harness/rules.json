@@ -111,6 +111,7 @@
     "debt": ["leader"],
     "task": ["implementer"],
     "update": [],
+    "evidence": [],
     "sandbox": [],
     "ci": []
   },
