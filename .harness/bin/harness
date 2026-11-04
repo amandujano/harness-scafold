@@ -991,6 +991,13 @@ def run_ast_grep(ctx):
     return [], []
 
 
+def unquoted(text):
+    """Drop one pair of string delimiters and keep quotes that belong to the title."""
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"`":
+        return text[1:-1]
+    return text
+
+
 def real_test_names(ctx):
     """Names that really are tests, by the stack's pattern, or None when that cannot be known."""
     spec = stack_config(ctx).get("test_names")
@@ -1004,7 +1011,7 @@ def real_test_names(ctx):
         return None
     names = set()
     for line in result.stdout.splitlines():
-        name = json.loads(line)["metaVariables"]["single"]["NAME"]["text"].strip("'\"`")
+        name = unquoted(json.loads(line)["metaVariables"]["single"]["NAME"]["text"])
         if re.search(spec.get("name_regex", "."), name):
             names.add(name)
     return names

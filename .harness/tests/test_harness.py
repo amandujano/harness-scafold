@@ -924,12 +924,21 @@ class EvidenceRestampTests(ProjectCase):
 
 
 class TraceParsingTests(unittest.TestCase):
-    def parse(self, target):
+    def cli(self):
         loader = importlib.machinery.SourceFileLoader("harness_cli", str(CLI))
         spec = importlib.util.spec_from_loader("harness_cli", loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        return module.mapped_test_names(target)
+        return module
+
+    def parse(self, target):
+        return self.cli().mapped_test_names(target)
+
+    def test_only_the_string_delimiters_leave_a_test_title(self):
+        unquoted = self.cli().unquoted
+        self.assertEqual(unquoted("""'converts "a" to "b"'"""), 'converts "a" to "b"')
+        self.assertEqual(unquoted('`plain`'), "plain")
+        self.assertEqual(unquoted("test_name"), "test_name")
 
     def test_comma_separated_names_need_no_backticks(self):
         self.assertEqual(self.parse("test_a, test_b"), ["test_a", "test_b"])
