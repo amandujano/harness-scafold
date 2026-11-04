@@ -48,5 +48,19 @@
         }
       }
     ]
+  },
+  "test_names": {
+    "language": "Go",
+    "rule": {
+      "any": [
+        {
+          "pattern": "func $NAME($T *testing.T) { $$$B }"
+        },
+        {
+          "pattern": "$T.Run($NAME, $$$B)"
+        }
+      ]
+    },
+    "name_regex": "."
   }
 }

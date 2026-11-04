@@ -38,5 +38,12 @@
   ],
   "ci": {
     "steps": []
+  },
+  "test_names": {
+    "language": "Python",
+    "rule": {
+      "pattern": "def $NAME($$$A): $$$B"
+    },
+    "name_regex": "^test"
   }
 }

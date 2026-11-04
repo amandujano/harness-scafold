@@ -42,6 +42,12 @@ CHECKPOINTS = ".harness/CHECKPOINTS.md"
 CHECKPOINTS_HEADER = ("<!-- Generated from .harness/rules.json by `harness checkpoints --write`. "
                       "Do not edit by hand. -->")
 RUNTIME_TEMPLATES = ("progress_current.md",)
+SANDBOX_PROFILE = ".harness/sandbox-profile.json"
+SANDBOX_NEVER_WRITABLE = (".harness/approvals", ".harness/bin", ".harness/rules.json", ".harness/config.json",
+                          ".harness", ".claude", ".git", ".github")
+TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders")
+SKILL_RUNNERS = {"npx", "bunx", "pnpx", "pnpm", "yarn", "npm"}
+SKILL_MUTATIONS = {"add", "update", "install", "remove"}
 OWNED_FILES = (".harness/bin/harness", ".harness/rules.json", ".harness/AGENTS.md")
 OWNED_TREES = (".claude/agents", ".claude/skills")
 PROJECT_OWNED_DOCS = {"architecture.md", "conventions.md"}
@@ -641,12 +647,15 @@ def guard_traceability(ctx, feature, reason=None):
     if unmapped:
         return [f"feature {name}: no test mapped for {', '.join(unmapped)}"]
     source = app_source_text(ctx)
+    tests = real_test_names(ctx)
     errors = []
     for requirement in ids:
         for test in mapped[requirement]:
             if not re.search(rf"(?<!\w){re.escape(test)}(?!\w)", source):
                 errors.append(f"feature {name}: {requirement} maps to `{test}`, which is not in "
                               f"{ctx.config['app_dir']}/")
+            elif tests is not None and test not in tests:
+                errors.append(f"feature {name}: {requirement} maps to `{test}`, which is not a test")
     return errors
 
 
@@ -782,6 +791,50 @@ def inv_checkpoints_current(ctx):
     return []
 
 
+def frontmatter(text):
+    """Scalars and simple lists from a Markdown frontmatter block; enough for agents and skills."""
+    match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    fields, key = {}, None
+    for line in match.group(1).splitlines() if match else []:
+        item = re.match(r"^\s+-\s+(.+)$", line)
+        pair = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if item and key:
+            fields[key].append(item.group(1).strip())
+        elif pair:
+            key = pair.group(1)
+            fields[key] = pair.group(2).strip().strip("'\"") if pair.group(2).strip() else []
+    return fields
+
+
+def skill_errors(ctx, name):
+    path = ctx.root / ".claude/skills" / name / "SKILL.md"
+    if not path.is_file():
+        return [f"skill {name} is assigned but missing"]
+    if frontmatter(read_text(path)).get("name") != name:
+        return [f"skill {name}: SKILL.md frontmatter does not name it"]
+    return []
+
+
+def inv_skills_assigned(ctx):
+    errors = []
+    for role, assignment in ctx.rules.get("skills", {}).items():
+        path = ctx.root / ".claude/agents" / f"{role}.md"
+        if not path.is_file():
+            errors.append(f"agent {role} has skills assigned but no definition")
+            continue
+        text = read_text(path)
+        fields = frontmatter(text)
+        preload, on_demand = assignment.get("preload", []), assignment.get("on_demand", [])
+        if fields.get("skills", []) != preload:
+            errors.append(f"agent {role}: skills frontmatter does not match rules.json: {preload}")
+        if on_demand and "Skill" not in str(fields.get("tools", "")):
+            errors.append(f"agent {role}: tools must include Skill to use on-demand skills")
+        for name in preload + on_demand:
+            errors += skill_errors(ctx, name)
+        errors += [f"agent {role}: does not say when to use {name}" for name in on_demand if f"`{name}`" not in text]
+    return errors
+
+
 def inv_task_record_valid(ctx):
     path = ctx.root / TASKS
     if not path.exists():
@@ -869,6 +922,7 @@ INVARIANTS = {
     "resolved_debt_has_evidence": inv_resolved_debt_has_evidence,
     "task_record_valid": inv_task_record_valid,
     "checkpoints_current": inv_checkpoints_current,
+    "skills_assigned": inv_skills_assigned,
     "scheduled_debt_promoted": inv_scheduled_debt_promoted,
 }
 
@@ -907,6 +961,51 @@ def run_tests(ctx):
         tail = "\n".join(result.stdout.strip().splitlines()[-15:])
         errors.append(f"tests failed (exit {result.returncode}): {command}\n{tail}")
     return errors, warnings
+
+
+def stack_config(ctx):
+    path = ctx.root / HARNESS_DIR / "stacks" / ctx.config["stack"] / "stack.json"
+    return load_json(path) if path.is_file() else {}
+
+
+def ast_grep_config(ctx):
+    return ctx.root / HARNESS_DIR / "stacks" / ctx.config["stack"] / "sgconfig.yml"
+
+
+def run_ast_grep(ctx):
+    """Project code rules. Optional: without the tool the check warns and continues."""
+    config, app_dir = ast_grep_config(ctx), ctx.root / ctx.config["app_dir"]
+    if not config.is_file() or not app_dir.is_dir():
+        return [], []
+    if not shutil.which("ast-grep"):
+        return [], ["ast-grep is not installed: code rules skipped, and test names matched as plain text "
+                    "(`brew install ast-grep`)"]
+    result = subprocess.run(["ast-grep", "scan", "--config", str(config), "--color", "never",
+                             "--report-style", "short", "."], cwd=str(app_dir), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    if result.returncode != 0:
+        tail = "\n".join(result.stdout.strip().splitlines()[-15:])
+        return [f"ast-grep rules failed:\n{tail}"], []
+    return [], []
+
+
+def real_test_names(ctx):
+    """Names that really are tests, by the stack's pattern, or None when that cannot be known."""
+    spec = stack_config(ctx).get("test_names")
+    if not spec or not shutil.which("ast-grep"):
+        return None
+    rule = json.dumps({"id": "test-names", "language": spec["language"], "rule": spec["rule"]})
+    result = subprocess.run(["ast-grep", "scan", "--inline-rules", rule, "--json=stream", "."],
+                            cwd=str(ctx.root / ctx.config["app_dir"]), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    if result.returncode != 0:
+        return None
+    names = set()
+    for line in result.stdout.splitlines():
+        name = json.loads(line)["metaVariables"]["single"]["NAME"]["text"].strip("'\"`")
+        if re.search(spec.get("name_regex", "."), name):
+            names.add(name)
+    return names
 
 
 def closing_documents(features_doc, debts_doc, name):
@@ -979,6 +1078,9 @@ def collect_problems(root, with_tests=True, assume_done=None, assume_resolved=No
             errors += INVARIANTS[invariant["id"]](ctx)
         except HarnessError as exc:
             errors.append(str(exc))
+    rule_errors, rule_warnings = run_ast_grep(ctx)
+    errors += rule_errors
+    warnings += rule_warnings
     if with_tests:
         test_errors, test_warnings = run_tests(ctx)
         errors += test_errors
@@ -1833,7 +1935,7 @@ def harness_call_denial(policy, argv):
     name = os.path.basename(argv[0])
     if runs_approve(argv, name):
         return "`harness approve` is human only"
-    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints"} & set(argv[1:]):
+    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints", "sandbox"} & set(argv[1:]):
         return "the CLI cannot be run through an unresolved variable"
     call = harness_subcommand(argv)
     if not call:
@@ -1852,6 +1954,21 @@ def harness_call_denial(policy, argv):
     allowed = policy.rules["command_roles"].get(call[0])
     if allowed is not None and role not in allowed:
         return f"role {role} may not run `harness {call[0]}`"
+    return None
+
+
+def skill_install_denial(argv):
+    """Skills reach a project through `harness update`, never through an unattended install."""
+    name = os.path.basename(argv[0])
+    args = plain_args(argv)
+    if name in SKILL_RUNNERS and args[:1] in (["dlx"], ["exec"]):
+        args = args[1:]
+    if name != "skills":
+        if name not in SKILL_RUNNERS or not args or not re.match(r"^skills(@.*)?$", args[0]):
+            return None
+        args = args[1:]
+    if args[:1] and args[0] in SKILL_MUTATIONS:
+        return "agents may not install skills; a human ships them through `harness update`"
     return None
 
 
@@ -1948,6 +2065,7 @@ def bash_denial_for(policy, command, cwd, variables=None):
             return denial
         if argv:
             denial = (harness_call_denial(policy, argv)
+                      or skill_install_denial(argv)
                       or cli_copy_denial(policy.root, cwd, argv, redirected)
                       or wrapper_denial(name, argv, command))
             if denial:
@@ -2457,8 +2575,8 @@ def copy_harness(source, target, stack_name, run):
             run.copy_tree(entry, destination)
         else:
             run.copy_file(entry, destination)
-    stack_file = f"stacks/{stack_name}/stack.json"
-    run.copy_file(source / HARNESS_DIR / stack_file, target / HARNESS_DIR / stack_file)
+    for path in stack_runtime_files(source, stack_name):
+        run.copy_file(path, target / path.relative_to(source))
     for name in RUNTIME_TEMPLATES:
         run.copy_file(source / HARNESS_DIR / "templates" / name, target / HARNESS_DIR / "templates" / name)
     for folder in ("approvals", "specs", "state", "progress"):
@@ -2618,11 +2736,18 @@ def file_hash(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def stack_runtime_files(root, stack):
+    """What a project needs from its stack: the manifest and its editable code rules."""
+    base = Path(root) / HARNESS_DIR / "stacks" / stack
+    paths = [base / "stack.json", base / "sgconfig.yml"] + sorted((base / "rules").glob("*.yml"))
+    return [path for path in paths if path.is_file()]
+
+
 def owned_files(root, stack):
     """Harness-owned paths under root. Everything else belongs to the project."""
     root = Path(root)
     paths = [root / name for name in OWNED_FILES]
-    paths.append(root / HARNESS_DIR / "stacks" / stack / "stack.json")
+    paths += stack_runtime_files(root, stack)
     paths += [root / HARNESS_DIR / "templates" / name for name in RUNTIME_TEMPLATES]
     for tree in OWNED_TREES:
         paths += [p for p in (root / tree).rglob("*") if p.is_file() and not set(p.parts) & GENERATED_NAMES]
@@ -2829,6 +2954,59 @@ def cmd_ci_github(args):
     return 0
 
 
+# --- sandbox ----------------------------------------------------------------
+
+
+def is_temporary(path):
+    """Temp folders stay writable under nono's default profile, so nothing there is protected."""
+    resolved = os.path.realpath(str(path))
+    roots = set(TEMP_ROOTS) | {os.path.realpath(tempfile.gettempdir())}
+    return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
+
+
+def sandbox_profile(rules):
+    """An allow-list: the project is read-only except the folders the workflow writes."""
+    policy = rules["sandbox"]
+    exposed = set(policy["writable"]) & set(SANDBOX_NEVER_WRITABLE)
+    if exposed:
+        raise HarnessError(f"rules.json: sandbox must not make these writable: {', '.join(sorted(exposed))}")
+    return {
+        "meta": {"name": "harness-sandbox", "description": "Project read-only except its working folders"},
+        "extends": "default",
+        "groups": {"include": policy["groups"]},
+        "workdir": {"access": "read"},
+        "filesystem": {
+            "allow": [f"$WORKDIR/{path}" for path in policy["writable"]] + policy["home_folders"],
+            "allow_file": policy["home_files"],
+            "read": policy["login_read"],
+            "bypass_protection": policy["login_read"],
+        },
+    }
+
+
+def sandbox_command(profile, claude_args):
+    arguments = claude_args[1:] if claude_args[:1] == ["--"] else claude_args
+    return ["nono", "run", "-s", "--allow-cwd", "--profile", str(profile), "--no-rollback", "--no-audit",
+            "--", "claude", *arguments]
+
+
+def cmd_sandbox(args):
+    root = find_root()
+    if load_config(root)["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: run `harness init <stack>` first")
+    rules = load_rules(root)
+    if "sandbox" not in rules:
+        raise HarnessError("rules.json has no sandbox section: run `harness update` first")
+    if not shutil.which("nono"):
+        raise HarnessError("nono is not installed: run `brew install nono`")
+    if is_temporary(root):
+        raise HarnessError(f"{root} is in a temporary folder, which the sandbox cannot protect; move the project")
+    path = root / SANDBOX_PROFILE
+    write_json(path, sandbox_profile(rules))
+    os.chdir(root)
+    os.execvp("nono", sandbox_command(path, args.claude_args))
+
+
 # --- Entry point ------------------------------------------------------------
 
 
@@ -2881,6 +3059,9 @@ def build_parser():
 
     approve = command("approve", cmd_approve, "record human approval of a spec")
     approve.add_argument("feature")
+
+    sandbox = command("sandbox", cmd_sandbox, "run Claude Code under the project's nono sandbox")
+    sandbox.add_argument("claude_args", nargs=argparse.REMAINDER)
 
     update = command("update", cmd_update, "update harness-owned files from the scaffold")
     update.add_argument("--dry-run", action="store_true")

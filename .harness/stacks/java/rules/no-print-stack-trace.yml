@@ -1,0 +1,6 @@
+id: no-print-stack-trace
+language: Java
+severity: error
+message: "printStackTrace is debug output; log or rethrow instead."
+rule:
+  pattern: "$E.printStackTrace()"

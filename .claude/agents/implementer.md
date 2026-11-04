@@ -1,8 +1,11 @@
 ---
 name: implementer
 description: Worker. Implements ONE feature according to its approved spec. Writes code, writes tests, and self-verifies.
-tools: Read, Write, Edit, Glob, Grep, Bash
+tools: Skill, Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
+skills:
+  - unit-testing
+  - clean-code-principles
 ---
 
 # Implementer Agent
@@ -107,6 +110,17 @@ Do not use the debt ledger to smuggle in unapproved work.
 
 The ledger records what you *did*, never permission for what you were not
 allowed to do.
+
+## Skills
+
+`unit-testing` and `clean-code-principles` are preloaded. Load these with the Skill tool
+when the trigger fits:
+
+- `clean-architecture` — when a task makes you decide which layer code belongs in.
+- `ast-grep` — for a mechanical refactor across many call sites, or a structural search
+  that text search gets wrong.
+
+Skills advise. The spec and `.harness/docs/architecture.md` win. Never install a skill.
 
 ## Hard rules
 

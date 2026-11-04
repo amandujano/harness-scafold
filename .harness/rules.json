@@ -111,7 +111,21 @@
     "debt": ["leader"],
     "task": ["implementer"],
     "update": [],
+    "sandbox": [],
     "ci": []
+  },
+  "skills": {
+    "leader": { "preload": ["feature-decomposition"], "on_demand": ["system-design", "clean-architecture"] },
+    "spec_author": { "preload": ["ears-specs"], "on_demand": ["system-design", "clean-architecture"] },
+    "implementer": { "preload": ["unit-testing", "clean-code-principles"], "on_demand": ["clean-architecture", "ast-grep"] },
+    "reviewer": { "preload": ["qa", "clean-code-principles"], "on_demand": ["clean-architecture", "ast-grep"] }
+  },
+  "sandbox": {
+    "writable": ["src", ".harness/state", ".harness/specs", ".harness/progress", ".harness/docs"],
+    "home_folders": ["$HOME/.claude"],
+    "home_files": ["$HOME/.claude.json"],
+    "login_read": ["$HOME/Library/Keychains"],
+    "groups": ["claude_code_macos", "python_runtime", "node_runtime", "go_runtime", "go_runtime_macos", "java_runtime", "git_config", "user_caches_macos"]
   },
   "required_files": [
     ".claude/CLAUDE.md",
@@ -146,7 +160,8 @@
     { "id": "resolved_debt_has_evidence", "checkpoint": "C7", "description": "Every `resolved` debt has current evidence or the feature that paid it." },
     { "id": "task_record_valid", "checkpoint": "C2", "description": "The task record, when present, is well formed." },
     { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every `scheduled` debt with `sdd: true` has a feature with the same `name` that is not `done`." },
-    { "id": "checkpoints_current", "checkpoint": "C1", "description": "`.harness/CHECKPOINTS.md` matches `.harness/rules.json`." }
+    { "id": "checkpoints_current", "checkpoint": "C1", "description": "`.harness/CHECKPOINTS.md` matches `.harness/rules.json`." },
+    { "id": "skills_assigned", "checkpoint": "C1", "description": "Every skill assigned in `.harness/rules.json` exists, and agent frontmatter matches the assignment." }
   ],
   "checkpoints": {
     "title": "CHECKPOINTS — Final State Evaluation",

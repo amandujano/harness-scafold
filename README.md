@@ -78,9 +78,9 @@ can tell them from your edits. `.github/workflows/harness.yml` exists only after
 run `harness ci github`.
 
 `.claude/` stays outside `.harness/` because Claude Code loads agents and settings
-from fixed locations. A generated `.harness/` is slim: from `stacks/` it keeps only its
-`stack.json`, the guides live in `.harness/docs/stack/`, and from `templates/` it keeps
-only the session template. Stack commands run from `src/`, so frameworks keep their usual
+from fixed locations. A generated `.harness/` is slim: from `stacks/` it keeps its `stack.json` and
+code rules, the guides live in `.harness/docs/stack/`, and from `templates/` it keeps only
+the session template. Stack commands run from `src/`, so frameworks keep their usual
 layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Maven.
 
 ## Daily Flow
@@ -107,6 +107,7 @@ layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Ma
 | `harness debt start <name>` | Leader: start paying an `sdd: false` debt in place |
 | `harness debt resolve <name>` | Leader: close a paid debt on its evidence |
 | `harness checkpoints [--write]` | Print `.harness/CHECKPOINTS.md`, or regenerate it (human only) |
+| `harness sandbox [-- <claude args>]` | Run Claude Code under the project's nono sandbox |
 | `harness update [--dry-run] [--force]` | Update harness-owned files from the scaffold |
 | `harness ci github [--force]` | Write the GitHub Actions workflow |
 | `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
@@ -135,6 +136,77 @@ finished)`. The leader asks you whether to resume or to block.
 - The briefing skips tests and slow guards, so it says when `harness next` may differ.
 - Tasks exist only for `sdd: true` features, so other work has no in-flight trace.
 
+## Skills
+
+Skills ship in `.claude/skills/`, and `harness update` delivers changes to them. The
+assignment lives in `skills` in `.harness/rules.json`, and `harness check` fails if an
+assigned skill is missing or an agent's frontmatter disagrees. Preloaded skills inject
+their full text into every agent run, so the list stays short; the rest load on demand.
+
+| Agent | Preloaded | On demand |
+|---|---|---|
+| `leader` | `feature-decomposition` | `system-design`, `clean-architecture` |
+| `spec_author` | `ears-specs` | `system-design`, `clean-architecture` |
+| `implementer` | `unit-testing`, `clean-code-principles` | `clean-architecture`, `ast-grep` |
+| `reviewer` | `qa`, `clean-code-principles` | `clean-architecture`, `ast-grep` |
+
+Skills advise. `.harness/docs/architecture.md` and the spec win.
+
+`clean-architecture` (wondelai/skills) and `clean-code-principles`
+(asyrafhussin/agent-skills) are vendored under MIT; each folder keeps its `LICENSE` and a
+`NOTICE.md`.
+
+`find-skills` and `npx skills find` are for you, to discover skills. The hook blocks
+agents from `npx skills add` and `npx skills update`: an unattended install is a supply
+chain risk. `sdd-*` and `spec-kitty` are not shipped because they bring a competing
+workflow, and the hook keeps them read-only here anyway.
+
+## Code Rules (Optional)
+
+With [ast-grep](https://ast-grep.github.io/) installed (`brew install ast-grep`),
+`harness check` runs each stack's rules from `src/`, and a finding fails the check. The
+rules are few and aimed at leftovers: debug output, and focused or skipped tests. It also
+confirms that each `R<n>` maps to a name that really is a test.
+
+Without it, `check` warns and continues, and test names are matched as plain text.
+
+Rules live in `.harness/stacks/<stack>/` and are yours to tune. `harness update` treats a
+local edit like any other: it keeps yours and writes `<file>.new`. The `generic` stack
+ships none.
+
+## Sandbox (Optional)
+
+`harness sandbox` runs Claude Code under [nono](https://nono.sh), which enforces the limit
+the hook cannot: a plain script is stopped at OS level.
+
+```bash
+brew install nono
+harness sandbox                  # or: harness sandbox -- -p "your prompt"
+```
+
+Demonstrated on macOS with nono 0.81.0, including from a Python script that the hook
+allowed:
+
+| Result | Paths |
+|---|---|
+| Writes fail | `.harness/approvals/`, `.harness/rules.json`, `.harness/bin/`, `.harness/config.json`, `.claude/`, root files such as `README.md` |
+| Writes work | `src/`, `.harness/state/`, `.harness/specs/`, `.harness/progress/`, `.harness/docs/` |
+
+What to know before relying on it:
+
+- It applies to the whole session, not per role. The hook still separates roles.
+- `.harness/state/` stays writable because `harness transition` needs it, so state is
+  still only guarded by the hook and by `harness check`.
+- `harness approve` must run from your own terminal, outside the sandbox.
+- `.git/` is read-only inside it, so commit from outside.
+- `~/.claude` stays writable because Claude Code needs it, so a sandboxed agent could change
+  your user-level settings. Review them if a session behaves unexpectedly.
+- It refuses a project in a temporary folder: those stay writable and nothing there would
+  be protected.
+- Claude Code's login needs read access to `~/Library/Keychains`, which relaxes one nono
+  default. Credential files such as `~/.ssh` stay blocked.
+- The profile is macOS-tested only, and interactive sessions were not exercised.
+
 ## Update a Project
 
 Run the global `harness` from inside a project; it uses its own scaffold clone as the
@@ -151,8 +223,8 @@ replaced. A locally modified file is kept, and the incoming version lands beside
 entries in `.claude/settings.json` are merged, and your other settings stay. A failure
 rolls everything back.
 
-It updates the CLI, `rules.json`, the session template, the project's `stack.json`,
-generic docs, agents and skills, and regenerates `.harness/CHECKPOINTS.md` from the
+It updates the CLI, `rules.json`, the session template, the project's `stack.json` and
+code rules, generic docs, agents and skills, and regenerates `.harness/CHECKPOINTS.md` from the
 resulting rules. If it keeps your `rules.json`, merge `rules.json.new` by hand and run
 `harness checkpoints --write`. Files an older project has beyond this are left alone.
 It never touches `.harness/state/`, `specs/`, `progress/`, `approvals/`,
@@ -207,10 +279,11 @@ Limits you should know:
   not every possible command. Script bodies run by an interpreter are not inspected.
   Git operations that swap whole trees, such as switching branches and `git stash`, stay
   allowed even though they rewrite files. So do build tools and `xargs` with piped paths.
-- **The human gate cannot fully stop a process running as your user.** `harness approve`
-  reads a random code from `/dev/tty`, ignores stdin, and records who and when in
-  `.harness/approvals/`. That guards against accidental and routine agent behaviour,
-  not a determined adversary. Audit approvals in code review or CI.
+- **Outside the sandbox, the human gate cannot fully stop a process running as your
+  user.** `harness approve` reads a random code from `/dev/tty`, ignores stdin, and records
+  who and when in `.harness/approvals/`. That guards against accidental and routine agent
+  behaviour, not a determined adversary. Use `harness sandbox`, and audit approvals in
+  code review or CI.
 - A hook that cannot start, such as with no `python3`, does not block anything: Claude
   Code only blocks on exit code 2. Rules that cannot be loaded do block.
 - The hook governs Claude Code only. Your editor and terminal are not restricted.

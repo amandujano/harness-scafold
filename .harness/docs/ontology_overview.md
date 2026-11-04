@@ -123,19 +123,27 @@ goes back to the reviewer.
   parses common write patterns, and a determined script can get past it. Build tools
   the role legitimately runs can also write anywhere. Switching branches and
   `git stash` stay allowed although they rewrite files.
+- `harness sandbox` closes part of that gap at OS level. Demonstrated on macOS with nono
+  0.81.0: writes to `.harness/approvals/`, `.harness/rules.json`, `.harness/bin/`,
+  `.harness/config.json` and `.claude/` failed from a plain script that the hook allows.
+  It applies to the whole session, not per role, so the hook still separates roles. It
+  does not protect `.harness/state/` or the other working folders, which the workflow
+  must write. It does not protect a project in a temporary folder, so it refuses one.
 - Claude Code treats any hook failure other than exit 2 as non-blocking, so a missing
   `python3` or a removed hook script fails open. `harness check` verifies that the hook
   is wired, not that it ran.
 - `harness approve` reads a random code from `/dev/tty`, and the hook denies the
-  spellings of it that it can see. A process running as the same user cannot be fully
-  stopped: this guards against accidental and routine agent behaviour, not a determined
-  adversary. Audit `.harness/approvals/` in code review or CI.
-- Script bodies run by an interpreter are not inspected, only the command line.
+  spellings of it that it can see. Without the sandbox, a process running as the same
+  user cannot be fully stopped: this guards against accidental and routine agent
+  behaviour, not a determined adversary. Audit `.harness/approvals/` in code review or CI.
+- Script bodies run by an interpreter are not inspected by the hook, only the command
+  line. Only the sandbox covers them, and only for the paths above.
 - The hook governs Claude Code only. `harness ci github` adds a workflow that runs
   `harness check` on every push, which also covers changes made outside Claude Code.
   It has not yet run on GitHub.
-- `harness check` confirms that each `R<n>` maps to a name that occurs in `src/`, not
-  that the test is meaningful. That judgment stays with the reviewer.
+- `harness check` confirms that each `R<n>` maps to a name that occurs in `src/`, and
+  with ast-grep that it really is a test. Whether the test is meaningful stays with the
+  reviewer.
 
 ## History: How the Design Was Chosen
 

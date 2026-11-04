@@ -1,0 +1,9 @@
+id: no-console-log
+language: TypeScript
+severity: error
+message: "console.log, console.debug or debugger left in application code."
+rule:
+  any:
+    - pattern: "console.log($$$A)"
+    - pattern: "console.debug($$$A)"
+    - kind: "debugger_statement"

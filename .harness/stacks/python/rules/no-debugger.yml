@@ -1,0 +1,9 @@
+id: no-debugger
+language: Python
+severity: error
+message: "A debugger call left in code stops the program."
+rule:
+  any:
+    - pattern: "breakpoint()"
+    - pattern: "pdb.set_trace()"
+    - pattern: "ipdb.set_trace()"

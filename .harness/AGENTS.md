@@ -37,6 +37,7 @@
 | `.harness/docs/model_strategy.md` | Which model each agent runs on and why | Before changing an agent's `model:` |
 | `.harness/CHECKPOINTS.md` | Criteria for a correct final state, generated from `.harness/rules.json` | For self-evaluation |
 | `.claude/agents/` | `leader`, `spec_author`, `implementer`, `reviewer` | If orchestrating work |
+| `.claude/skills/` | Skills, assigned to agents in `.harness/rules.json` | Your agent file says which and when |
 
 ## 3. Hard Rules
 
@@ -50,6 +51,8 @@
 - **Declare every shortcut** in `.harness/state/techdebt_list.json` the moment you
   take it. An undeclared shortcut is a rejection. Never remove a debt entry.
 - **If you don't know something, look in `.harness/docs/`** before inventing it.
+- **Skills advise; project rules win.** `.harness/docs/architecture.md` and the spec take
+  precedence over any skill. Never install a skill.
 
 ## 4. Workflow
 

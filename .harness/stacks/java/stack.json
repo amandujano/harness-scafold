@@ -58,5 +58,30 @@
         }
       }
     ]
+  },
+  "test_names": {
+    "language": "Java",
+    "rule": {
+      "all": [
+        {
+          "kind": "method_declaration"
+        },
+        {
+          "has": {
+            "kind": "modifiers",
+            "has": {
+              "regex": "^@([\\w.]+\\.)?(Test|ParameterizedTest|RepeatedTest)\\b"
+            }
+          }
+        },
+        {
+          "has": {
+            "field": "name",
+            "pattern": "$NAME"
+          }
+        }
+      ]
+    },
+    "name_regex": "."
   }
 }

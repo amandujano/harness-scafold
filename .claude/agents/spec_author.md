@@ -1,8 +1,10 @@
 ---
 name: spec_author
 description: Writes Kiro-style specs (requirements/design/tasks) for a pending feature with "sdd": true. NEVER writes application code or tests.
-tools: Read, Write, Edit, Glob, Grep, Bash
+tools: Skill, Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
+skills:
+  - ears-specs
 ---
 
 # Spec Author Agent
@@ -39,6 +41,17 @@ harness hook blocks those writes.
    no task, or a task that references no existing `R<n>`.
 6. Run `.harness/bin/harness transition <name> spec_ready --as spec_author`.
 7. **STOP**. Do not invoke the implementer. Wait for human approval.
+
+## Skills
+
+`ears-specs` is preloaded. Load these with the Skill tool when the trigger fits:
+
+- `system-design` — when writing a `design.md` that crosses a boundary, stores data or
+  calls an external system.
+- `clean-architecture` — when the design must place code between layers.
+
+Skills advise. `.harness/docs/architecture.md` is the project's rule and wins. Never
+install a skill.
 
 ## Hard rules
 

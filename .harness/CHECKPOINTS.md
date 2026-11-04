@@ -13,6 +13,7 @@
 - [ ] **[auto]** `.harness/bin/harness check` exits 0.
 - [ ] **[auto]** `.claude/settings.json` runs the harness PreToolUse and SessionStart hooks.
 - [ ] **[auto]** `.harness/CHECKPOINTS.md` matches `.harness/rules.json`.
+- [ ] **[auto]** Every skill assigned in `.harness/rules.json` exists, and agent frontmatter matches the assignment.
 
 ## C2 — State is Consistent
 

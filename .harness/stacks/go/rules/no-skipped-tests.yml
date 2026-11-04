@@ -1,0 +1,7 @@
+id: no-skipped-tests
+language: Go
+severity: error
+message: "A skipped test proves nothing."
+rule:
+  kind: call_expression
+  regex: '^\w+\.(Skip|Skipf|SkipNow)\('

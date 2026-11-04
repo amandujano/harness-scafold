@@ -75,5 +75,19 @@
         "working-directory": "src"
       }
     ]
+  },
+  "test_names": {
+    "language": "TypeScript",
+    "rule": {
+      "any": [
+        {
+          "pattern": "it($NAME, $$$R)"
+        },
+        {
+          "pattern": "test($NAME, $$$R)"
+        }
+      ]
+    },
+    "name_regex": "."
   }
 }

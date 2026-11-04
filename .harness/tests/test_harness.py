@@ -123,7 +123,7 @@ class ProjectCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
 
     def write_impl(self, name="alpha"):
-        self.write("src/app/traced.py", "test_it = None\n")
+        self.write("src/app/traced.py", "def test_it():\n    pass\n")
         self.write(f".harness/progress/impl_{name}.md", "## Traceability\n- R1 → `test_it`\n")
 
     def write_review(self, name="alpha", verdict="APPROVED"):
@@ -1123,7 +1123,7 @@ class ScenarioCase(ProjectCase):
         self.attempts += 1
         if not is_debt and not self.work_through_tasks(name):
             return
-        self.write("src/app/traced.py", "test_it = None\n")
+        self.write("src/app/traced.py", "def test_it():\n    pass\n")
         report = f"impl_debt-{name}" if is_debt else f"impl_{name}"
         self.write(f".harness/progress/{report}.md",
                    f"## Traceability\n- R1 → `test_it`\n\nattempt {self.attempts}\n")
@@ -1330,7 +1330,7 @@ class InterruptionScenarioTests(ScenarioCase):
 
     def test_interruption_after_the_report_still_routes_to_resume(self):
         self.in_progress()
-        self.write("src/app/traced.py", "test_it = None\n")
+        self.write("src/app/traced.py", "def test_it():\n    pass\n")
         self.write_impl()
         self.assertEqual(self.run_cli("task", "start", "alpha", "T1").returncode, 0)
         self.assertIn("resume alpha at T1", self.run_cli("next").stdout)
@@ -1860,11 +1860,12 @@ class UpdateTests(UpdateCiCase):
 
     def test_local_change_is_kept_with_a_new_file_and_a_warning(self):
         rel = self.change_source()
-        (self.root / rel).write_text("mine\n")
+        mine = (self.root / rel).read_text() + "\nmine\n"
+        (self.root / rel).write_text(mine)
         self.commit()
         result = self.run_cli("update")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.root / rel).read_text(), "mine\n")
+        self.assertEqual((self.root / rel).read_text(), mine)
         self.assertIn("incoming", (self.root / f"{rel}.new").read_text())
         self.assertIn("[WARN]", result.stdout)
 
@@ -1981,8 +1982,10 @@ class UpdateTests(UpdateCiCase):
         self.assertEqual((self.root / ".harness/CHECKPOINTS.md").read_bytes(), before)
 
     def test_generated_project_is_slim(self):
-        self.assertEqual(sorted(str(p.relative_to(self.root)) for p in (self.root / ".harness/stacks").rglob("*")
-                                if p.is_file()), [".harness/stacks/python/stack.json"])
+        expected = {".harness/stacks/python/stack.json", ".harness/stacks/python/sgconfig.yml",
+                    ".harness/stacks/python/rules/no-debugger.yml", ".harness/stacks/python/rules/no-skipped-tests.yml"}
+        self.assertEqual({str(p.relative_to(self.root)) for p in (self.root / ".harness/stacks").rglob("*")
+                          if p.is_file()}, expected)
         self.assertEqual([p.name for p in (self.root / ".harness/templates").iterdir()], ["progress_current.md"])
         self.assertTrue((self.root / ".harness/docs/stack/testing.md").is_file())
 
@@ -2028,6 +2031,25 @@ class UpdateTests(UpdateCiCase):
         self.assertEqual(self.project_bytes(".harness", ".claude"), before)
         self.assertFalse((self.root / ".harness-init-manifest.json").exists())
         self.assertNotIn("incoming", (self.root / first).read_text())
+
+    def test_local_rule_edit_is_kept_on_update(self):
+        rel = ".harness/stacks/python/rules/no-debugger.yml"
+        path = self.source / rel
+        path.write_text(path.read_text().replace("A debugger call", "A debugger statement"))
+        (self.root / rel).write_text((self.root / rel).read_text().replace("A debugger call", "Mine"))
+        self.commit()
+        self.assertEqual(self.run_cli("update").returncode, 0)
+        self.assertIn("Mine", (self.root / rel).read_text())
+        self.assertTrue((self.root / f"{rel}.new").is_file())
+
+    def test_update_delivers_new_rules_and_skills(self):
+        (self.source / ".harness/stacks/python/rules/new-rule.yml").write_text(
+            "id: new-rule\nlanguage: Python\nseverity: error\nmessage: x\nrule:\n  pattern: forbidden_call()\n")
+        (self.source / ".claude/skills/new-skill").mkdir()
+        (self.source / ".claude/skills/new-skill/SKILL.md").write_text("---\nname: new-skill\n---\n")
+        self.assertEqual(self.run_cli("update").returncode, 0)
+        self.assertTrue((self.root / ".harness/stacks/python/rules/new-rule.yml").is_file())
+        self.assertTrue((self.root / ".claude/skills/new-skill/SKILL.md").is_file())
 
     def test_refuses_the_scaffold_and_the_projects_own_copy(self):
         self.assertIn("scaffold", self.run_cli("update", cwd=self.source).stderr)
@@ -2182,6 +2204,255 @@ class CheckpointTests(HookCase):
                 self.assert_blocked(self.bash(f"echo x > {self.FILE}", agent))
         self.assert_blocked(self.bash("$H checkpoints --write", "leader"))
         self.assert_allowed(self.bash("harness checkpoints", "reviewer"))
+
+
+class SkillTests(HookCase):
+    def agent(self, role):
+        return self.path(f".claude/agents/{role}.md")
+
+    def test_every_assigned_skill_ships_with_matching_frontmatter(self):
+        self.assert_check_passes()
+        rules = self.read_json(RULES)
+        self.assertEqual(sorted(rules["skills"]), ["implementer", "leader", "reviewer", "spec_author"])
+        for name in ("feature-decomposition", "ears-specs", "system-design", "qa", "ast-grep",
+                     "clean-architecture", "clean-code-principles", "unit-testing"):
+            text = self.path(f".claude/skills/{name}/SKILL.md").read_text()
+            self.assertTrue(text.startswith(f"---\nname: {name}\ndescription:"), name)
+
+    def test_vendored_skills_keep_their_license_and_stay_inert(self):
+        for name, holder in (("clean-architecture", "Wondel.ai"), ("clean-code-principles", "Asyraf Hussin")):
+            folder = self.path(f".claude/skills/{name}")
+            self.assertIn(holder, (folder / "LICENSE").read_text())
+            self.assertIn("MIT License", (folder / "NOTICE.md").read_text())
+            text = "\n".join(p.read_text() for p in folder.rglob("*.md"))
+            self.assertNotRegex(text, r"npm install|npx |pip install|curl |/Users/|tag=wondelai")
+
+    def test_missing_assigned_skill_fails_check(self):
+        shutil.rmtree(self.path(".claude/skills/qa"))
+        self.assert_check_fails("skill qa is assigned but missing")
+
+    def test_skill_with_the_wrong_name_fails_check(self):
+        path = self.path(".claude/skills/qa/SKILL.md")
+        path.write_text(path.read_text().replace("name: qa", "name: other", 1))
+        self.assert_check_fails("frontmatter does not name it")
+
+    def test_frontmatter_disagreeing_with_the_map_fails_check(self):
+        path = self.agent("reviewer")
+        path.write_text(path.read_text().replace("  - qa\n", ""))
+        self.assert_check_fails("skills frontmatter does not match")
+
+    def test_on_demand_skills_need_the_skill_tool(self):
+        path = self.agent("leader")
+        path.write_text(path.read_text().replace("tools: Skill, ", "tools: "))
+        self.assert_check_fails("tools must include Skill")
+
+    def test_on_demand_skill_needs_a_stated_trigger(self):
+        path = self.agent("implementer")
+        path.write_text(path.read_text().replace("`ast-grep`", "ast-grep"))
+        self.assert_check_fails("does not say when to use ast-grep")
+
+    def test_older_rules_without_a_skill_map_pass(self):
+        rules = self.read_json(RULES)
+        del rules["skills"]
+        rules["invariants"] = [i for i in rules["invariants"]
+                               if i["id"] not in ("skills_assigned", "checkpoints_current")]
+        self.write(RULES, json.dumps(rules))
+        shutil.rmtree(self.path(".claude/skills/qa"))
+        self.assert_check_passes()
+
+    def test_agents_may_not_install_skills(self):
+        commands = ["npx skills add owner/repo", "npx -y skills add owner/repo", "npx skills update",
+                    "npx skills@latest add owner/repo", "bunx skills add x", "pnpm dlx skills add x",
+                    "npm exec skills add x", "skills add x"]
+        for agent in (None, "implementer", "general-purpose"):
+            for command in commands:
+                with self.subTest(agent=agent, command=command):
+                    self.assert_blocked(self.bash(command, agent))
+
+    def test_finding_skills_stays_allowed(self):
+        for command in ("npx skills find testing", "npx skills list", "npx jest add", "npm install"):
+            with self.subTest(command=command):
+                self.assert_allowed(self.bash(command, "implementer"))
+
+    def test_agents_may_not_write_skills(self):
+        for agent in ("leader", "implementer", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.write_call(".claude/skills/qa/SKILL.md", agent))
+
+
+class SandboxTests(HookCase):
+    def load_cli(self):
+        loader = importlib.machinery.SourceFileLoader("harness_cli", str(CLI))
+        spec = importlib.util.spec_from_loader("harness_cli", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def test_agents_may_not_run_it(self):
+        for agent in (None, "implementer", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.bash("harness sandbox", agent))
+        self.assert_blocked(self.bash("$H sandbox", "leader"))
+
+    def test_missing_nono_is_a_clear_error(self):
+        empty = Path(self.tmp) / "emptybin"
+        empty.mkdir()
+        result = subprocess.run([sys.executable, str(self.cli), "sandbox"], cwd=str(self.root),
+                                capture_output=True, text=True, env={"PATH": str(empty)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("brew install nono", result.stderr)
+
+    def test_refuses_a_temporary_project(self):
+        fake = Path(self.tmp) / "bin"
+        fake.mkdir()
+        (fake / "nono").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "nono").chmod(0o755)
+        result = subprocess.run([sys.executable, str(self.cli), "sandbox"], cwd=str(self.root),
+                                capture_output=True, text=True, env={"PATH": str(fake)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("temporary folder", result.stderr)
+
+    def test_older_rules_get_a_clear_message(self):
+        rules = self.read_json(RULES)
+        del rules["sandbox"]
+        self.write(RULES, json.dumps(rules))
+        self.assertIn("harness update", self.run_cli("sandbox").stderr)
+
+    def test_profile_is_an_allow_list_without_protected_paths(self):
+        module = self.load_cli()
+        profile = module.sandbox_profile(self.read_json(RULES))
+        self.assertEqual(profile["workdir"], {"access": "read"})
+        writable = profile["filesystem"]["allow"]
+        self.assertIn("$WORKDIR/src", writable)
+        self.assertIn("$WORKDIR/.harness/state", writable)
+        for protected in (".harness", ".harness/approvals", ".harness/bin", ".claude", ".git"):
+            self.assertNotIn(f"$WORKDIR/{protected}", writable)
+
+    def test_rules_cannot_expose_protected_paths(self):
+        module = self.load_cli()
+        for path in (".harness/approvals", ".harness", ".claude", ".git"):
+            rules = self.read_json(RULES)
+            rules["sandbox"]["writable"].append(path)
+            with self.subTest(path=path), self.assertRaises(module.HarnessError):
+                module.sandbox_profile(rules)
+
+    def test_claude_arguments_pass_through(self):
+        command = self.load_cli().sandbox_command("/p.json", ["--", "-p", "hello"])
+        self.assertEqual(command[command.index("--") + 1:], ["claude", "-p", "hello"])
+
+    @unittest.skipUnless(shutil.which("nono"), "nono is not installed")
+    def test_generated_profile_validates_with_nono(self):
+        module = self.load_cli()
+        path = Path(self.tmp) / "profile.json"
+        path.write_text(json.dumps(module.sandbox_profile(self.read_json(RULES))))
+        result = subprocess.run(["nono", "profile", "validate", str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+AST_GREP = shutil.which("ast-grep")
+
+
+class AstGrepTests(ProjectCase):
+    NO_TOOL = {"PATH": "/usr/bin:/bin"}
+
+    def check_without_tool(self):
+        return subprocess.run([sys.executable, str(self.cli), "check"], cwd=str(self.root),
+                              capture_output=True, text=True, env=self.NO_TOOL)
+
+    def test_missing_tool_warns_and_continues(self):
+        self.write("src/app/bad.py", "breakpoint()\n")
+        result = self.check_without_tool()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ast-grep is not installed", result.stdout)
+
+    def test_missing_tool_falls_back_to_a_text_match(self):
+        self.make_done_ready()
+        self.write("src/app/traced.py", "test_it = None\n")
+        self.set_features(feature(status="done"))
+        result = self.check_without_tool()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("matched as plain text", result.stdout)
+
+    @unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+    def test_finding_fails_the_check(self):
+        self.write("src/app/bad.py", "def f():\n    breakpoint()\n")
+        self.assert_check_fails("ast-grep rules failed")
+
+    @unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+    def test_clean_code_passes_and_print_is_not_flagged(self):
+        self.write("src/app/fine.py", "def f():\n    print('hello')\n")
+        self.assert_check_passes()
+
+    @unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+    def test_a_project_can_tune_its_rules(self):
+        self.write("src/app/bad.py", "def f():\n    breakpoint()\n")
+        self.path(".harness/stacks/python/rules/no-debugger.yml").unlink()
+        self.assert_check_passes()
+
+    @unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+    def test_mapped_name_must_really_be_a_test(self):
+        self.make_done_ready()
+        self.write("src/app/traced.py", "test_it = None\n")
+        self.set_features(feature(status="done"))
+        self.assert_check_fails("maps to `test_it`, which is not a test")
+
+    @unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+    def test_helper_function_is_not_a_test(self):
+        self.make_done_ready()
+        self.write("src/app/traced.py", "def helper():\n    pass\n\n\ntest_it = helper\n")
+        self.set_features(feature(status="done"))
+        self.assert_check_fails("which is not a test")
+
+    def test_generic_stack_ships_no_rules(self):
+        self.assertFalse((SOURCE / ".harness/stacks/generic/sgconfig.yml").exists())
+
+
+@unittest.skipUnless(AST_GREP, "ast-grep is not installed")
+class StackRuleTests(unittest.TestCase):
+    SAMPLES = {
+        "python": ("bad.py", "import pdb\ndef f():\n    breakpoint()\n    pdb.set_trace()\n\n"
+                   "@unittest.skip('x')\ndef test_a():\n    pass\n", 3,
+                   "good.py", "def f():\n    print('ok')\n"),
+        "go": ("bad_test.go", 'package x\nimport "testing"\nfunc TestA(t *testing.T) {\n\tt.Skip("x")\n\tprintln("y")\n}\n',
+               2, "good.go", 'package x\nimport "fmt"\nfunc F() { fmt.Println("ok") }\n'),
+        "java": ("Bad.java", 'class Bad { @Disabled("x") void a() {} @org.junit.Ignore void b() {} '
+                 "void c() { try { d(); } catch (Exception e) { e.printStackTrace(); } } }\n", 3,
+                 "Good.java", 'class Good { void a() { System.out.println("Hello"); } }\n'),
+        "nest": ("bad.spec.ts", "it.only('a', () => {});\nxit('b', () => {});\nconsole.log('c');\ndebugger;\n", 4,
+                 "good.ts", "console.error('kept');\nlogger.log('ok');\n"),
+    }
+
+    def scan(self, stack, filename, text):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / filename).write_text(text)
+            config = SOURCE / f".harness/stacks/{stack}/sgconfig.yml"
+            result = subprocess.run(["ast-grep", "scan", "--config", str(config), "--json=stream", "."],
+                                    cwd=folder, capture_output=True, text=True)
+        return [json.loads(line)["ruleId"] for line in result.stdout.splitlines()]
+
+    def test_rules_flag_bad_code_and_leave_good_code_alone(self):
+        for stack, (bad, bad_text, expected, good, good_text) in self.SAMPLES.items():
+            with self.subTest(stack=stack):
+                self.assertEqual(len(self.scan(stack, bad, bad_text)), expected)
+                self.assertEqual(self.scan(stack, good, good_text), [])
+
+    def test_test_name_rules_find_real_tests_only(self):
+        samples = {
+            "python": ("t.py", "def test_a():\n    pass\n\ndef helper():\n    pass\n", ["test_a"]),
+            "go": ("t_test.go", 'package x\nimport "testing"\nfunc TestA(t *testing.T) {}\nfunc helper(x int) {}\n', ["TestA"]),
+            "java": ("T.java", "class T { @Test void aTest() {} void helper() {} }\n", ["aTest"]),
+            "nest": ("t.spec.ts", "it('does a thing', () => {});\nhelper('x');\n", ["does a thing"]),
+        }
+        for stack, (filename, text, expected) in samples.items():
+            with self.subTest(stack=stack), tempfile.TemporaryDirectory() as folder:
+                (Path(folder) / filename).write_text(text)
+                spec = json.loads((SOURCE / f".harness/stacks/{stack}/stack.json").read_text())["test_names"]
+                rule = json.dumps({"id": "t", "language": spec["language"], "rule": spec["rule"]})
+                result = subprocess.run(["ast-grep", "scan", "--inline-rules", rule, "--json=stream", "."],
+                                        cwd=folder, capture_output=True, text=True)
+                names = [json.loads(l)["metaVariables"]["single"]["NAME"]["text"].strip("'\"")
+                         for l in result.stdout.splitlines()]
+                self.assertEqual([n for n in names if re.search(spec["name_regex"], n)], expected)
 
 
 class LifecycleRegressionTests(ProjectCase):

@@ -1,0 +1,11 @@
+id: no-focused-tests
+language: TypeScript
+severity: error
+message: "A focused test silently disables the rest of the suite."
+rule:
+  any:
+    - pattern: "it.only($$$A)"
+    - pattern: "test.only($$$A)"
+    - pattern: "describe.only($$$A)"
+    - pattern: "fit($$$A)"
+    - pattern: "fdescribe($$$A)"
