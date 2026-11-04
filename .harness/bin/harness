@@ -1,0 +1,3226 @@
+#!/usr/bin/env python3
+"""harness: project bootstrap and deterministic rule enforcement.
+
+The rules live in .harness/rules.json. This file evaluates them. Python 3.9+
+standard library only, so it runs unchanged in projects of any stack.
+"""
+
+import argparse
+import base64
+import contextlib
+import copy
+import datetime
+import getpass
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+
+HARNESS_DIR = ".harness"
+RULES = ".harness/rules.json"
+CONFIG = ".harness/config.json"
+FEATURES = ".harness/state/feature_list.json"
+DEBTS = ".harness/state/techdebt_list.json"
+TASKS = ".harness/state/tasks.json"
+SPEC_FILES = ("requirements.md", "design.md", "tasks.md")
+MANIFEST = ".harness-init-manifest.json"
+OWNED_MANIFEST = ".harness/manifest.json"
+HARNESS_VERSION = "1.0.0"
+CHECKPOINTS = ".harness/CHECKPOINTS.md"
+CHECKPOINTS_HEADER = ("<!-- Generated from .harness/rules.json by `harness checkpoints --write`. "
+                      "Do not edit by hand. -->")
+RUNTIME_TEMPLATES = ("progress_current.md",)
+SANDBOX_PROFILE = ".harness/sandbox-profile.json"
+SANDBOX_PREFLIGHT_SECONDS = 30
+EXIT_HOOK_BLOCK = 2
+SANDBOX_NEVER_WRITABLE = (".harness/approvals", ".harness/bin", ".harness/rules.json", ".harness/config.json",
+                          ".harness", ".claude", ".git", ".github")
+TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders")
+SKILL_RUNNERS = {"npx", "bunx", "pnpx", "pnpm", "yarn", "npm"}
+SKILL_MUTATIONS = {"add", "update", "install", "remove"}
+OWNED_FILES = (".harness/bin/harness", ".harness/rules.json", ".harness/AGENTS.md")
+OWNED_TREES = (".claude/agents", ".claude/skills")
+PROJECT_OWNED_DOCS = {"architecture.md", "conventions.md"}
+SETTINGS = ".claude/settings.json"
+WORKFLOW = ".github/workflows/harness.yml"
+RESERVED_DIRS = {".harness", ".claude", ".git"}
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+TASK_LINE = re.compile(r"^\s*[-*]\s*\[( |x|X)\]", re.MULTILINE)
+REQUIREMENT_ID = re.compile(r"^#+\s*(R\d+)\b", re.MULTILINE)
+VERDICT_LINE = re.compile(r"^\*\*Verdict:\*\*\s*(\S+)", re.MULTILINE)
+TRACE_LINE = re.compile(r"^\s*[-*]?\s*(R\d+)\s*(?:→|->)\s*(.+)$", re.MULTILINE)
+CODE_FENCE = re.compile(r"^\s*(```|~~~)")
+SKIPPED_APP_DIRS = {".git", "node_modules", "target", "dist", "build", "coverage", "__pycache__", ".venv"}
+README_MARKER = b"<!-- harness-scaffold-readme -->"
+EXIT_INIT_CHECK_FAILED = 3
+TASK_ID = re.compile(r"\bT\d+\b")
+ACCEPTANCE_LINE = re.compile(r"^\s*[-*]\s*A(\d+):\s*\[( |x|X)\]")
+BRIEFING_LIST_CAP = 10
+BRIEFING_LOG_CAP = 8
+BRIEFING_LINE_WIDTH = 160
+HOOK_CONTEXT_LIMIT = 9000
+GIT_TIMEOUT_SECONDS = 5
+
+# Top-level .harness entries that belong to one project and are never copied.
+GENERATED_NAMES = {"__pycache__", "settings.local.json"}
+NOT_COPIED = {"manifest.json", "tests", "state", "approvals", "specs", "progress", "config.json", "templates", "stacks", "__pycache__"}
+
+
+class HarnessError(Exception):
+    pass
+
+
+def ok(message):
+    print(f"[OK]    {message}")
+
+
+def warn(message):
+    print(f"[WARN]  {message}")
+
+
+def fail(message):
+    print(f"[FAIL]  {message}")
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{path} is not valid UTF-8: {exc}")
+
+
+def load_json(path):
+    try:
+        return json.loads(read_text(path))
+    except FileNotFoundError:
+        raise HarnessError(f"missing file: {path}")
+    except ValueError as exc:
+        raise HarnessError(f"invalid JSON in {path}: {exc}")
+    except OSError as exc:
+        raise HarnessError(f"cannot read {path}: {exc}")
+
+
+def default_file_mode():
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def stage_json(path, data):
+    """Write data to a temporary sibling with the mode the final file must have."""
+    path = Path(path)
+    handle, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        os.chmod(temp_name, stat.S_IMODE(path.stat().st_mode) if path.exists() else default_file_mode())
+    except BaseException:
+        os.unlink(temp_name)
+        raise
+    return temp_name
+
+
+def write_json(path, data):
+    os.replace(stage_json(path, data), path)
+
+
+def write_json_together(documents):
+    """Replace several files as one step: a failure leaves all of them as they were."""
+    staged, replaced = [], []
+    originals = {Path(path): Path(path).read_bytes() for path, _ in documents}
+    try:
+        for path, data in documents:
+            staged.append((Path(path), stage_json(path, data)))
+        for path, temp_name in staged:
+            os.replace(temp_name, path)
+            replaced.append(path)
+    except BaseException:
+        for path in replaced:
+            path.write_bytes(originals[path])
+        for _, temp_name in staged:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+        raise
+
+
+def find_root(start=None):
+    current = Path(start or os.getcwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / HARNESS_DIR).is_dir():
+            return candidate
+    raise HarnessError("not inside a harness project (no .harness/ found)")
+
+
+def require_human(action):
+    """Prove a person is at the terminal: read a random code from /dev/tty, never stdin.
+
+    A same-user process cannot be fully stopped. This guards against accidental and
+    routine agent behaviour, not against a determined adversary.
+    """
+    try:
+        terminal = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        raise HarnessError(f"{action} is human only: run it from your own interactive terminal")
+    with os.fdopen(terminal, "r+b", buffering=0) as tty:
+        code = secrets.token_hex(3)
+        tty.write(f"{action}\nType this code to confirm: {code}\n> ".encode("utf-8"))
+        answer = tty.readline().decode("utf-8", "replace").strip()
+    if not secrets.compare_digest(answer, code):
+        raise HarnessError(f"{action} cancelled: the code did not match")
+
+
+def approver_identity():
+    identity = {"user": getpass.getuser()}
+    for field, key in (("git_name", "user.name"), ("git_email", "user.email")):
+        result = subprocess.run(["git", "config", key], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            identity[field] = result.stdout.strip()
+    return identity
+
+
+# --- Schema validation ------------------------------------------------------
+
+
+def validate_rules(rules):
+    errors = []
+    if not isinstance(rules, dict):
+        return ["rules.json must be an object"]
+    required = ("states", "initial_state", "agents", "transitions", "roles", "protected",
+                "unknown_role_allow", "debt", "required_files", "invariants", "command_roles")
+    for key in required:
+        if key not in rules:
+            errors.append(f"rules.json: missing key {key}")
+    if errors:
+        return errors
+    states = set(rules["states"])
+    actors = set(rules["agents"]) | {"human", "any_agent"}
+    for index, rule in enumerate(rules["transitions"]):
+        label = f"rules.json: transition {index}"
+        if not set(rule.get("from", [])) <= states or not rule.get("from"):
+            errors.append(f"{label}: unknown from state")
+        if rule.get("to") != "@previous" and rule.get("to") not in states:
+            errors.append(f"{label}: unknown to state")
+        if rule.get("actor") not in actors:
+            errors.append(f"{label}: unknown actor")
+        for guard in rule.get("guards", []):
+            if guard not in GUARDS:
+                errors.append(f"{label}: unknown guard {guard}")
+    for invariant in rules["invariants"]:
+        if invariant.get("id") not in INVARIANTS:
+            errors.append(f"rules.json: unknown invariant {invariant.get('id')}")
+    # Optional: a project may keep an older rules.json beside a newer CLI, and that must
+    # not turn into a hook that blocks everything.
+    if "checkpoints" in rules:
+        known = {section.get("id") for section in rules["checkpoints"].get("sections", [])}
+        for invariant in rules["invariants"]:
+            if invariant.get("checkpoint") not in known:
+                errors.append(f"rules.json: invariant {invariant.get('id')} names an unknown checkpoint")
+    for key in ("statuses", "severities", "kinds", "append_only_roles", "transitions"):
+        if key not in rules["debt"]:
+            errors.append(f"rules.json: debt missing {key}")
+    for rule in rules["debt"].get("transitions", []):
+        if not set(rule.get("from", [])) <= set(rules["debt"].get("statuses", [])):
+            errors.append("rules.json: debt transition has an unknown from status")
+        for guard in rule.get("guards", []):
+            if guard not in GUARDS:
+                errors.append(f"rules.json: unknown guard {guard}")
+    return errors
+
+
+def validate_config(config):
+    errors = []
+    if not isinstance(config, dict):
+        return ["config.json must be an object"]
+    for key in ("project", "stack", "app_dir", "commands"):
+        if key not in config:
+            errors.append(f"config.json: missing key {key}")
+    if errors:
+        return errors
+    if not isinstance(config["commands"], dict):
+        errors.append("config.json: commands must be an object")
+    elif "test" not in config["commands"]:
+        errors.append("config.json: commands.test is missing")
+    errors += generated_path_errors(config.get("generated_paths", []), "config.json")
+    return errors
+
+
+def generated_path_errors(paths, label):
+    errors = []
+    for declared in paths:
+        parts = str(declared).casefold().split("/")
+        if str(declared).startswith("/") or ".." in parts or set(parts) & RESERVED_DIRS:
+            errors.append(f"{label}: generated path {declared} is not allowed")
+    return errors
+
+
+def reachable_states(rules, sdd):
+    reached = {rules["initial_state"]}
+    for rule in rules["transitions"]:
+        if rule.get("when", {}).get("sdd", sdd) == sdd and rule["to"] != "@previous":
+            reached.add(rule["to"])
+    return reached
+
+
+def blockable_states(rules):
+    states = set()
+    for rule in rules["transitions"]:
+        if rule["to"] == "blocked":
+            states |= set(rule["from"])
+    return states
+
+
+def validate_features(doc, rules):
+    errors = []
+    if not isinstance(doc, dict) or not isinstance(doc.get("features"), list):
+        return ["feature_list.json: must be an object with a features array"]
+    if not isinstance(doc.get("project"), str):
+        errors.append("feature_list.json: project must be a string")
+    seen_ids, seen_names = set(), set()
+    for index, feature in enumerate(doc["features"]):
+        if not isinstance(feature, dict):
+            errors.append(f"feature_list.json: feature {index} must be an object")
+            continue
+        label = f"feature {feature.get('name', index)}"
+        for key, kind in (("id", int), ("name", str), ("title", str), ("description", str),
+                          ("acceptance", list), ("sdd", bool), ("status", str)):
+            if not isinstance(feature.get(key), kind):
+                errors.append(f"{label}: {key} is missing or has the wrong type")
+        if errors:
+            continue
+        if not SLUG.match(feature["name"]):
+            errors.append(f"{label}: name must be a lowercase slug")
+        if feature["id"] in seen_ids or feature["name"] in seen_names:
+            errors.append(f"{label}: duplicate id or name")
+        seen_ids.add(feature["id"])
+        seen_names.add(feature["name"])
+        if not feature["acceptance"]:
+            errors.append(f"{label}: acceptance must not be empty")
+        status = feature["status"]
+        if status not in rules["states"]:
+            errors.append(f"{label}: unknown status {status}")
+        elif status not in reachable_states(rules, feature["sdd"]):
+            errors.append(f"{label}: status {status} is illegal when sdd is {feature['sdd']}")
+        if status == "blocked":
+            origin = feature.get("blocked_from")
+            if origin not in blockable_states(rules) or origin not in reachable_states(rules, feature["sdd"]):
+                errors.append(f"{label}: blocked without a valid blocked_from")
+    return errors
+
+
+def validate_debts(doc, rules):
+    errors = []
+    if not isinstance(doc, dict) or not isinstance(doc.get("debts"), list):
+        return ["techdebt_list.json: must be an object with a debts array"]
+    debt_rules = rules["debt"]
+    for index, debt in enumerate(doc["debts"]):
+        if not isinstance(debt, dict):
+            errors.append(f"techdebt_list.json: debt {index} must be an object")
+            continue
+        label = f"debt {debt.get('name', index)}"
+        for key in ("id", "name", "title", "description", "interest"):
+            if not debt.get(key):
+                errors.append(f"{label}: {key} is missing")
+        if not SLUG.match(str(debt.get("name", ""))):
+            errors.append(f"{label}: name must be a lowercase slug")
+        if debt.get("status") not in debt_rules["statuses"]:
+            errors.append(f"{label}: unknown status {debt.get('status')}")
+        if debt.get("severity") not in debt_rules["severities"]:
+            errors.append(f"{label}: unknown severity {debt.get('severity')}")
+        if debt.get("kind") not in debt_rules["kinds"]:
+            errors.append(f"{label}: unknown kind {debt.get('kind')}")
+        if not isinstance(debt.get("sdd"), bool):
+            errors.append(f"{label}: sdd must be a boolean")
+        acceptance = debt.get("acceptance")
+        if not isinstance(acceptance, list) or not acceptance:
+            errors.append(f"{label}: acceptance must not be empty")
+        origin = debt.get("origin")
+        if not isinstance(origin, dict) or not all(origin.get(k) for k in ("agent", "feature", "session")):
+            errors.append(f"{label}: origin must name agent, feature and session")
+    return errors
+
+
+# --- Project context --------------------------------------------------------
+
+
+class Context:
+    def __init__(self, root, rules, config, features_doc, debts_doc):
+        self.root = Path(root)
+        self.rules = rules
+        self.config = config
+        self.features_doc = features_doc
+        self.debts_doc = debts_doc
+
+    @property
+    def features(self):
+        return self.features_doc["features"]
+
+    @property
+    def debts(self):
+        return self.debts_doc["debts"]
+
+    def spec_path(self, name, filename):
+        return self.root / HARNESS_DIR / "specs" / name / filename
+
+    def progress_path(self, filename):
+        return self.root / HARNESS_DIR / "progress" / filename
+
+    def approval_path(self, name):
+        return self.root / HARNESS_DIR / "approvals" / f"{name}.json"
+
+    def active_work(self):
+        """The one feature or debt being worked on, if any."""
+        for item in self.features + self.debts:
+            if item["status"] == "in_progress":
+                return item
+        return None
+
+
+def load_rules(root):
+    rules = load_json(Path(root) / RULES)
+    errors = validate_rules(rules)
+    if errors:
+        raise HarnessError("; ".join(errors))
+    return rules
+
+
+def load_config(root):
+    config = load_json(Path(root) / CONFIG)
+    errors = validate_config(config)
+    if errors:
+        raise HarnessError("; ".join(errors))
+    return config
+
+
+def load_context(root):
+    rules = load_rules(root)
+    config = load_config(root)
+    if config["stack"] is None:
+        raise HarnessError("project is not initialized: run `harness init <stack>`")
+    features_doc = load_json(Path(root) / FEATURES)
+    debts_doc = load_json(Path(root) / DEBTS)
+    errors = validate_features(features_doc, rules) + validate_debts(debts_doc, rules)
+    if errors:
+        raise HarnessError("; ".join(errors))
+    return Context(root, rules, config, features_doc, debts_doc)
+
+
+# --- Spec approval ----------------------------------------------------------
+
+
+def spec_fingerprint(ctx, name):
+    fingerprint = {}
+    for filename in SPEC_FILES:
+        text = read_text(ctx.spec_path(name, filename))
+        if filename == "tasks.md":
+            # Ticking a task is progress, not a spec change.
+            text = normalize_tasks(text)
+        fingerprint[filename] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return fingerprint
+
+
+def outside_code_fences(text):
+    lines, fenced = [], False
+    for line in text.splitlines():
+        if CODE_FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def parse_requirements(text):
+    return REQUIREMENT_ID.findall(outside_code_fences(text))
+
+
+def parse_tasks(text):
+    tasks = []
+    for line in outside_code_fences(text).splitlines():
+        match = TASK_LINE.match(line)
+        if match:
+            task_id = TASK_ID.search(line)
+            tasks.append({"id": task_id.group(0) if task_id else None, "open": match.group(1) == " ",
+                          "refs": re.findall(r"\bR\d+\b", line), "line": line.strip()})
+    return tasks
+
+
+def normalize_tasks(text):
+    lines, fenced = [], False
+    for line in text.split("\n"):
+        if CODE_FENCE.match(line):
+            fenced = not fenced
+        lines.append(line if fenced else re.sub(r"^(\s*[-*]\s*)\[[xX]\]", r"\1[ ]", line))
+    return "\n".join(lines)
+
+
+def missing_spec_files(ctx, name):
+    return [f for f in SPEC_FILES if not ctx.spec_path(name, f).is_file()]
+
+
+def approval_errors(ctx, name):
+    path = ctx.approval_path(name)
+    if not path.is_file():
+        return [f"feature {name}: no human approval (run `harness approve {name}`)"]
+    if missing_spec_files(ctx, name):
+        return [f"feature {name}: approval cannot be verified, spec files are missing"]
+    try:
+        recorded = load_json(path).get("files")
+    except (HarnessError, AttributeError) as exc:
+        return [f"feature {name}: unreadable approval: {exc}"]
+    if recorded != spec_fingerprint(ctx, name):
+        return [f"feature {name}: spec changed after approval (run `harness approve {name}` again)"]
+    return []
+
+
+# --- Guards: named checks shared by transitions and invariants ---------------
+
+
+def guard_spec_files_exist(ctx, feature, reason=None):
+    missing = missing_spec_files(ctx, feature["name"])
+    if missing:
+        return [f"feature {feature['name']}: missing spec files: {', '.join(missing)}"]
+    return []
+
+
+def guard_valid_approval(ctx, feature, reason=None):
+    return approval_errors(ctx, feature["name"])
+
+
+def guard_no_other_in_progress(ctx, item, reason=None):
+    """Only one thing is active at a time, whether a feature or a debt."""
+    errors = []
+    features = [f["name"] for f in ctx.features if f["status"] == "in_progress" and f is not item]
+    debts = [d["name"] for d in ctx.debts if d["status"] == "in_progress" and d is not item]
+    if features:
+        errors.append(f"another feature is in_progress: {', '.join(features)}")
+    if debts:
+        errors.append(f"a debt is in_progress: {', '.join(debts)}")
+    return errors
+
+
+def guard_no_other_in_progress_on_resume(ctx, feature, reason=None):
+    if feature.get("blocked_from") != "in_progress":
+        return []
+    return guard_no_other_in_progress(ctx, feature)
+
+
+def guard_spec_shape(ctx, feature, reason=None):
+    name = feature["name"]
+    if missing_spec_files(ctx, name):
+        return []
+    ids = parse_requirements(read_text(ctx.spec_path(name, "requirements.md")))
+    tasks = parse_tasks(read_text(ctx.spec_path(name, "tasks.md")))
+    errors = []
+    if not ids:
+        errors.append(f"feature {name}: requirements.md declares no R<n>")
+    if not tasks:
+        errors.append(f"feature {name}: tasks.md has no tasks")
+    for task in tasks:
+        unknown = [ref for ref in task["refs"] if ref not in ids]
+        if not task["refs"]:
+            errors.append(f"feature {name}: task references no R<n>: {task['line']}")
+        elif unknown:
+            errors.append(f"feature {name}: task references unknown {', '.join(unknown)}: {task['line']}")
+    return errors
+
+
+def is_debt(item):
+    return "severity" in item
+
+
+def work_label(item):
+    return f"{'debt' if is_debt(item) else 'feature'} {item['name']}"
+
+
+def report_id(item):
+    return f"debt-{item['name']}" if is_debt(item) else item["name"]
+
+
+def report_paths(ctx, item):
+    return ctx.progress_path(f"impl_{report_id(item)}.md"), ctx.progress_path(f"review_{report_id(item)}.md")
+
+
+def evidence_hashes(impl, review):
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (impl, review)}
+
+
+def latest_verdict(review):
+    verdicts = VERDICT_LINE.findall(read_text(review))
+    return verdicts[-1] if verdicts else None
+
+
+def review_evidence(ctx, item):
+    """The single reading of a feature's or debt's evidence: (state, problems).
+
+    States: approved, missing_impl, missing_review, stale, rejected, invalid.
+    A newer report means the verdict no longer covers the work, whatever it said.
+    Modification times do not survive a clone, so closed work carries hashes of its
+    evidence, and those alone decide.
+    """
+    label = work_label(item)
+    impl, review = report_paths(ctx, item)
+    problems = []
+    if not impl.is_file():
+        problems.append(f"{label}: no implementation report at {impl.name}")
+    if not review.is_file():
+        problems.append(f"{label}: no review report at {review.name}")
+    if problems:
+        return ("missing_impl" if not impl.is_file() else "missing_review"), problems
+    stored = item.get("evidence")
+    if stored is not None:
+        if stored != evidence_hashes(impl, review):
+            return "stale", [f"{label}: evidence changed after the {label.split()[0]} closed"]
+    elif impl.stat().st_mtime > review.stat().st_mtime:
+        return "stale", [f"{label}: review is older than the implementation report"]
+    latest = latest_verdict(review)
+    if latest == "CHANGES_REQUESTED":
+        return "rejected", [f"{label}: review verdict is not APPROVED (CHANGES_REQUESTED)"]
+    if latest != "APPROVED":
+        return "invalid", [f"{label}: review verdict is not APPROVED (no valid verdict)"]
+    return "approved", []
+
+
+def guard_review_approved(ctx, feature, reason=None):
+    return review_evidence(ctx, feature)[1]
+
+
+def guard_tasks_complete(ctx, feature, reason=None):
+    if not feature["sdd"]:
+        return []
+    path = ctx.spec_path(feature["name"], "tasks.md")
+    if not path.is_file():
+        return [f"feature {feature['name']}: tasks.md is missing"]
+    tasks = parse_tasks(read_text(path))
+    if not tasks:
+        return [f"feature {feature['name']}: tasks.md has no tasks"]
+    open_tasks = sum(1 for task in tasks if task["open"])
+    if open_tasks:
+        return [f"feature {feature['name']}: {open_tasks} unchecked task(s) in tasks.md"]
+    return []
+
+
+def app_source_text(ctx):
+    chunks = []
+    for folder, directories, files in os.walk(ctx.root / ctx.config["app_dir"]):
+        directories[:] = [d for d in directories if d not in SKIPPED_APP_DIRS]
+        for filename in files:
+            try:
+                chunks.append((Path(folder) / filename).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                continue
+    return "\n".join(chunks)
+
+
+def mapped_test_names(target):
+    quoted = re.findall(r"`([^`]+)`", target)
+    return quoted or [part.split()[0] for part in target.split(",") if part.strip()]
+
+
+def guard_traceability(ctx, feature, reason=None):
+    if not feature["sdd"]:
+        return []
+    name = feature["name"]
+    requirements = ctx.spec_path(name, "requirements.md")
+    if not requirements.is_file():
+        return [f"feature {name}: requirements.md is missing"]
+    ids = parse_requirements(read_text(requirements))
+    if not ids:
+        return [f"feature {name}: requirements.md declares no R<n>"]
+    report = ctx.progress_path(f"impl_{name}.md")
+    if not report.is_file():
+        return [f"feature {name}: no implementation report at {report.name}"]
+    mapped = {}
+    for requirement, target in TRACE_LINE.findall(read_text(report)):
+        mapped.setdefault(requirement, []).extend(mapped_test_names(target))
+    unmapped = [r for r in ids if r not in mapped]
+    if unmapped:
+        return [f"feature {name}: no test mapped for {', '.join(unmapped)}"]
+    source = app_source_text(ctx)
+    tests = real_test_names(ctx)
+    errors = []
+    for requirement in ids:
+        for test in mapped[requirement]:
+            if not re.search(rf"(?<!\w){re.escape(test)}(?!\w)", source):
+                errors.append(f"feature {name}: {requirement} maps to `{test}`, which is not in "
+                              f"{ctx.config['app_dir']}/")
+            elif tests is not None and test not in tests:
+                errors.append(f"feature {name}: {requirement} maps to `{test}`, which is not a test")
+    return errors
+
+
+def guard_debt_paid_in_place(ctx, debt, reason=None):
+    if debt["sdd"]:
+        return [f"debt {debt['name']}: sdd is true, so it is paid by promoting it to a feature"]
+    return []
+
+
+def guard_acceptance_covered(ctx, debt, reason=None):
+    """The review must tick one `A<n>` line per acceptance item; the last line of each wins."""
+    review = report_paths(ctx, debt)[1]
+    if not review.is_file():
+        return [f"debt {debt['name']}: no review report at {review.name}"]
+    ticked = {}
+    for line in outside_code_fences(read_text(review)).splitlines():
+        match = ACCEPTANCE_LINE.match(line)
+        if match:
+            ticked[int(match.group(1))] = match.group(2) != " "
+    missing = [f"A{n}" for n in range(1, len(debt["acceptance"]) + 1) if not ticked.get(n)]
+    if missing:
+        return [f"debt {debt['name']}: acceptance not covered by the review: {', '.join(missing)}"]
+    return []
+
+
+def guard_debt_check_green(ctx, debt, reason=None):
+    if review_evidence(ctx, debt)[0] != "approved":
+        return []  # review_approved reports this, and there is nothing to hash yet.
+    errors, _ = collect_problems(ctx.root, with_tests=True, assume_resolved=debt["name"])
+    return errors
+
+
+def guard_reason_given(ctx, feature, reason=None):
+    return [] if reason else ["a --reason is required to block a feature"]
+
+
+def guard_check_green(ctx, feature, reason=None):
+    errors, _ = collect_problems(ctx.root, with_tests=True, assume_done=feature["name"])
+    return errors
+
+
+GUARDS = {
+    "spec_files_exist": guard_spec_files_exist,
+    "valid_approval": guard_valid_approval,
+    "no_other_in_progress": guard_no_other_in_progress,
+    "no_other_in_progress_on_resume": guard_no_other_in_progress_on_resume,
+    "spec_shape": guard_spec_shape,
+    "review_approved": guard_review_approved,
+    "tasks_complete": guard_tasks_complete,
+    "traceability": guard_traceability,
+    "reason_given": guard_reason_given,
+    "debt_paid_in_place": guard_debt_paid_in_place,
+    "acceptance_covered": guard_acceptance_covered,
+    "debt_check_green": guard_debt_check_green,
+    "check_green": guard_check_green,
+}
+
+
+# --- Invariants -------------------------------------------------------------
+
+
+def inv_hook_wired(ctx):
+    try:
+        settings = load_json(ctx.root / ".claude/settings.json")
+    except HarnessError as exc:
+        return [str(exc)]
+    errors = []
+    for event, argument in (("PreToolUse", "pre-tool-use"), ("SessionStart", "session-start")):
+        if not any(is_harness_hook(hook, argument) for hook in event_hooks(settings, event)):
+            errors.append(f".claude/settings.json does not run the harness {event} hook")
+    return errors
+
+
+def event_hooks(settings, event):
+    """Every hook entry of an event, tolerating any shape a hand-edited file may have."""
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
+    entries = []
+    for group in groups if isinstance(groups, list) else []:
+        listed = group.get("hooks") if isinstance(group, dict) else None
+        entries += listed if isinstance(listed, list) else []
+    return entries
+
+
+def is_harness_hook(hook, argument):
+    if not isinstance(hook, dict) or not isinstance(hook.get("args"), list):
+        return False
+    return "harness" in str(hook.get("command", "")) and argument in hook["args"]
+
+
+def inv_single_in_progress(ctx):
+    active = [work_label(item) for item in ctx.features + ctx.debts if item["status"] == "in_progress"]
+    if len(active) > 1:
+        return [f"more than one thing is in_progress: {', '.join(active)}"]
+    return []
+
+
+def inv_resolved_debt_has_evidence(ctx):
+    errors = []
+    for debt in ctx.debts:
+        if debt["status"] != "resolved":
+            continue
+        if "evidence" in debt:
+            errors += review_evidence(ctx, debt)[1]
+        elif "resolved_by" not in debt:
+            errors.append(f"debt {debt['name']}: resolved without evidence")
+    return errors
+
+
+def render_checkpoints(rules):
+    """The text of the checkpoints file: a pure function of rules.json."""
+    if "checkpoints" not in rules:
+        raise HarnessError("rules.json has no checkpoints section")
+    document = rules["checkpoints"]
+    lines = [CHECKPOINTS_HEADER, "", f"# {document['title']}", ""]
+    lines += [f"> {line}".rstrip() for line in document["intro"]]
+    for section in document["sections"]:
+        lines += ["", f"## {section['id']} — {section['title']}", ""]
+        automated = section.get("auto", []) + [i["description"] for i in rules["invariants"]
+                                               if i.get("checkpoint") == section["id"]]
+        lines += [f"- [ ] **[auto]** {item}" for item in automated]
+        lines += [f"- [ ] {item}" for item in section.get("judgment", [])]
+    lines += ["", "---", ""]
+    for index, note in enumerate(document["notes"]):
+        lines += ([""] if index else []) + [note]
+    return "\n".join(lines) + "\n"
+
+
+def inv_checkpoints_current(ctx):
+    path = ctx.root / CHECKPOINTS
+    if path.is_file() and read_text(path) != render_checkpoints(ctx.rules):
+        return [f"{CHECKPOINTS} is stale: a human must run `harness checkpoints --write`"]
+    return []
+
+
+def frontmatter(text):
+    """Scalars and simple lists from a Markdown frontmatter block; enough for agents and skills."""
+    match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    fields, key = {}, None
+    for line in match.group(1).splitlines() if match else []:
+        item = re.match(r"^\s+-\s+(.+)$", line)
+        pair = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if item and key:
+            fields[key].append(item.group(1).strip())
+        elif pair:
+            key = pair.group(1)
+            fields[key] = pair.group(2).strip().strip("'\"") if pair.group(2).strip() else []
+    return fields
+
+
+def skill_errors(ctx, name):
+    path = ctx.root / ".claude/skills" / name / "SKILL.md"
+    if not path.is_file():
+        return [f"skill {name} is assigned but missing"]
+    if frontmatter(read_text(path)).get("name") != name:
+        return [f"skill {name}: SKILL.md frontmatter does not name it"]
+    return []
+
+
+def inv_skills_assigned(ctx):
+    errors = []
+    for role, assignment in ctx.rules.get("skills", {}).items():
+        path = ctx.root / ".claude/agents" / f"{role}.md"
+        if not path.is_file():
+            errors.append(f"agent {role} has skills assigned but no definition")
+            continue
+        text = read_text(path)
+        fields = frontmatter(text)
+        preload, on_demand = assignment.get("preload", []), assignment.get("on_demand", [])
+        if fields.get("skills", []) != preload:
+            errors.append(f"agent {role}: skills frontmatter does not match rules.json: {preload}")
+        if on_demand and "Skill" not in str(fields.get("tools", "")):
+            errors.append(f"agent {role}: tools must include Skill to use on-demand skills")
+        for name in preload + on_demand:
+            errors += skill_errors(ctx, name)
+        errors += [f"agent {role}: does not say when to use {name}" for name in on_demand if f"`{name}`" not in text]
+    return errors
+
+
+def inv_task_record_valid(ctx):
+    path = ctx.root / TASKS
+    if not path.exists():
+        return []
+    try:
+        record = load_json(path)
+    except HarnessError as exc:
+        return [str(exc)]
+    if not isinstance(record, dict) or not isinstance(record.get("started"), list):
+        return [f"{TASKS} must hold a started list"]
+    return []
+
+
+def sdd_features(ctx, statuses):
+    return [f for f in ctx.features if f["sdd"] and f["status"] in statuses]
+
+
+def inv_spec_files_present(ctx):
+    errors = []
+    for feature in sdd_features(ctx, ("spec_ready", "in_progress", "done")):
+        errors += guard_spec_files_exist(ctx, feature)
+    return errors
+
+
+def inv_spec_shape_valid(ctx):
+    errors = []
+    for feature in sdd_features(ctx, ("spec_ready", "in_progress", "done")):
+        errors += guard_spec_shape(ctx, feature)
+    return errors
+
+
+def inv_approval_valid(ctx):
+    errors = []
+    for feature in sdd_features(ctx, ("in_progress", "done")):
+        errors += approval_errors(ctx, feature["name"])
+    return errors
+
+
+def inv_done_tasks_complete(ctx):
+    errors = []
+    for feature in sdd_features(ctx, ("done",)):
+        errors += guard_tasks_complete(ctx, feature)
+    return errors
+
+
+def inv_done_traceability(ctx):
+    errors = []
+    for feature in sdd_features(ctx, ("done",)):
+        errors += guard_traceability(ctx, feature)
+    return errors
+
+
+def inv_done_review_approved(ctx):
+    errors = []
+    for feature in ctx.features:
+        if feature["status"] == "done":
+            errors += guard_review_approved(ctx, feature)
+    return errors
+
+
+def inv_no_open_critical_debt(ctx):
+    return [f"debt {d['name']}: critical debt is open" for d in ctx.debts
+            if d["severity"] == "critical" and d["status"] == "open"]
+
+
+def inv_scheduled_debt_promoted(ctx):
+    errors = []
+    open_features = {f["name"] for f in ctx.features if f["status"] != "done"}
+    for debt in ctx.debts:
+        if debt["status"] == "scheduled" and debt["sdd"] and debt["name"] not in open_features:
+            errors.append(f"debt {debt['name']}: scheduled with sdd true but has no matching open feature")
+    return errors
+
+
+INVARIANTS = {
+    "hook_wired": inv_hook_wired,
+    "single_in_progress": inv_single_in_progress,
+    "spec_files_present": inv_spec_files_present,
+    "spec_shape_valid": inv_spec_shape_valid,
+    "approval_valid": inv_approval_valid,
+    "done_tasks_complete": inv_done_tasks_complete,
+    "done_traceability": inv_done_traceability,
+    "done_review_approved": inv_done_review_approved,
+    "no_open_critical_debt": inv_no_open_critical_debt,
+    "resolved_debt_has_evidence": inv_resolved_debt_has_evidence,
+    "task_record_valid": inv_task_record_valid,
+    "checkpoints_current": inv_checkpoints_current,
+    "skills_assigned": inv_skills_assigned,
+    "scheduled_debt_promoted": inv_scheduled_debt_promoted,
+}
+
+
+# --- check ------------------------------------------------------------------
+
+
+def unique(messages):
+    return list(dict.fromkeys(messages))
+
+
+def matches_any(patterns, text):
+    return any(re.search(p, text, re.MULTILINE) for p in patterns)
+
+
+def run_tests(ctx):
+    errors, warnings = [], []
+    command = ctx.config["commands"].get("test")
+    if not command:
+        return errors, warnings
+    app_dir = ctx.root / ctx.config["app_dir"]
+    if not app_dir.is_dir():
+        return [f"application directory {ctx.config['app_dir']}/ does not exist"], warnings
+    result = subprocess.run(command, shell=True, cwd=str(app_dir), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    detection = ctx.config.get("no_tests", {})
+    found_nothing = (matches_any(detection.get("patterns", []), result.stdout)
+                     and not matches_any(detection.get("unless", []), result.stdout))
+    exit_means_empty = result.returncode == 0 or result.returncode in detection.get("exit_codes", [])
+    if found_nothing and exit_means_empty:
+        if any(f["status"] == "done" for f in ctx.features):
+            errors.append("a feature is done but the test command found no tests")
+        else:
+            warnings.append("the test command found no tests")
+    elif result.returncode != 0:
+        tail = "\n".join(result.stdout.strip().splitlines()[-15:])
+        errors.append(f"tests failed (exit {result.returncode}): {command}\n{tail}")
+    return errors, warnings
+
+
+def stack_config(ctx):
+    path = ctx.root / HARNESS_DIR / "stacks" / ctx.config["stack"] / "stack.json"
+    return load_json(path) if path.is_file() else {}
+
+
+def ast_grep_config(ctx):
+    return ctx.root / HARNESS_DIR / "stacks" / ctx.config["stack"] / "sgconfig.yml"
+
+
+def run_ast_grep(ctx):
+    """Project code rules. Optional: without the tool the check warns and continues."""
+    config, app_dir = ast_grep_config(ctx), ctx.root / ctx.config["app_dir"]
+    if not config.is_file() or not app_dir.is_dir():
+        return [], []
+    if not shutil.which("ast-grep"):
+        return [], ["ast-grep is not installed: code rules skipped, and test names matched as plain text "
+                    "(`brew install ast-grep`)"]
+    result = subprocess.run(["ast-grep", "scan", "--config", str(config), "--color", "never",
+                             "--report-style", "short", "."], cwd=str(app_dir), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    if result.returncode != 0:
+        tail = "\n".join(result.stdout.strip().splitlines()[-15:])
+        return [f"ast-grep rules failed:\n{tail}"], []
+    return [], []
+
+
+def unquoted(text):
+    """Drop one pair of string delimiters and keep quotes that belong to the title."""
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"`":
+        return text[1:-1]
+    return text
+
+
+def real_test_names(ctx):
+    """Names that really are tests, by the stack's pattern, or None when that cannot be known."""
+    spec = stack_config(ctx).get("test_names")
+    if not spec or not shutil.which("ast-grep"):
+        return None
+    rule = json.dumps({"id": "test-names", "language": spec["language"], "rule": spec["rule"]})
+    result = subprocess.run(["ast-grep", "scan", "--inline-rules", rule, "--json=stream", "."],
+                            cwd=str(ctx.root / ctx.config["app_dir"]), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    if result.returncode != 0:
+        return None
+    names = set()
+    for line in result.stdout.splitlines():
+        name = unquoted(json.loads(line)["metaVariables"]["single"]["NAME"]["text"])
+        if re.search(spec.get("name_regex", "."), name):
+            names.add(name)
+    return names
+
+
+def closing_documents(features_doc, debts_doc, name):
+    """The state after closing a feature, computed without touching the inputs.
+
+    The debt a feature pays is scheduled under the feature's name.
+    """
+    features_doc, debts_doc = copy.deepcopy(features_doc), copy.deepcopy(debts_doc)
+    for feature in features_doc["features"]:
+        if feature["name"] == name:
+            feature["status"] = "done"
+    for debt in debts_doc["debts"]:
+        if debt["name"] == name and debt["status"] == "scheduled":
+            debt["status"] = "resolved"
+            debt["resolved_by"] = {"feature": name}
+    return features_doc, debts_doc
+
+
+def resolving_document(debts_doc, name, evidence):
+    """The debt list after resolving a debt, computed without touching the input."""
+    debts_doc = copy.deepcopy(debts_doc)
+    for debt in debts_doc["debts"]:
+        if debt["name"] == name:
+            debt["status"] = "resolved"
+            debt["evidence"] = evidence
+    return debts_doc
+
+
+def collect_problems(root, with_tests=True, assume_done=None, assume_resolved=None):
+    root = Path(root)
+    try:
+        rules = load_rules(root)
+    except HarnessError as exc:
+        return [str(exc)], []
+    try:
+        config = load_config(root)
+    except HarnessError as exc:
+        return [str(exc)], []
+    if config["stack"] is None:
+        return ["project is not initialized: run `harness init <stack>`"], []
+
+    errors, warnings = [], []
+    for relative in rules["required_files"]:
+        if not (root / relative).is_file():
+            errors.append(f"required file is missing: {relative}")
+    if not config["commands"].get("test"):
+        errors.append(f"commands.test is not configured in {CONFIG}")
+
+    documents, state_errors = {}, []
+    for key, path, validator in (("features", FEATURES, validate_features),
+                                 ("debts", DEBTS, validate_debts)):
+        try:
+            documents[key] = load_json(root / path)
+            state_errors += validator(documents[key], rules)
+        except HarnessError as exc:
+            state_errors.append(str(exc))
+    errors += state_errors
+    if state_errors:
+        return errors, warnings
+
+    features_doc, debts_doc = documents["features"], documents["debts"]
+    if assume_done:
+        features_doc, debts_doc = closing_documents(features_doc, debts_doc, assume_done)
+    ctx = Context(root, rules, config, features_doc, debts_doc)
+    if assume_resolved:
+        paying = next(d for d in ctx.debts if d["name"] == assume_resolved)
+        ctx.debts_doc = resolving_document(debts_doc, assume_resolved, evidence_hashes(*report_paths(ctx, paying)))
+    for invariant in rules["invariants"]:
+        try:
+            errors += INVARIANTS[invariant["id"]](ctx)
+        except HarnessError as exc:
+            errors.append(str(exc))
+    rule_errors, rule_warnings = run_ast_grep(ctx)
+    errors += rule_errors
+    warnings += rule_warnings
+    if with_tests:
+        test_errors, test_warnings = run_tests(ctx)
+        errors += test_errors
+        warnings += test_warnings
+    return unique(errors), unique(warnings)
+
+
+def report_check(root, with_tests):
+    errors, warnings = collect_problems(root, with_tests=with_tests)
+    for message in warnings:
+        warn(message)
+    for message in errors:
+        fail(message)
+    if errors:
+        fail(f"{len(errors)} problem(s) found")
+        return 1
+    ok("harness check passed" if with_tests else "harness check passed (tests skipped)")
+    return 0
+
+
+def cmd_check(args):
+    return report_check(find_root(), with_tests=not args.no_tests)
+
+
+# --- next -------------------------------------------------------------------
+
+
+def closing_step(ctx, item):
+    """(command, rule) that closes a feature or debt."""
+    if is_debt(item):
+        return f"harness debt resolve {item['name']}", match_debt_transition(ctx.rules, item, "resolved")
+    return f"harness transition {item['name']} done", match_transition(ctx.rules, item, "done")
+
+
+def next_for_active(ctx, item, deep=True):
+    label = work_label(item)
+    in_flight = in_flight_tasks(ctx, item)
+    if in_flight:
+        return f"implementer: resume {item['name']} at {in_flight[0]['task']} (started, not finished)"
+    state, _ = review_evidence(ctx, item)
+    if state == "missing_impl":
+        return f"implementer: {'pay' if is_debt(item) else 'implement'} {label}"
+    if state == "rejected":
+        return f"implementer: address review_{report_id(item)}.md for {label}"
+    if state != "approved":
+        return f"reviewer: review {label}"
+    command, rule = closing_step(ctx, item)
+    errors = transition_errors(ctx, item, rule) if deep else []
+    if errors:
+        return f"implementer: resolve before closing {item['name']}: {errors[0].splitlines()[0]}"
+    return f"leader: run `{command}`"
+
+
+def next_action(ctx, deep=True):
+    """The one legal next action. With deep=False no slow guard or test runs."""
+    active = ctx.active_work()
+    critical = [d for d in ctx.debts if d["severity"] == "critical" and d["status"] == "open"]
+    if critical:
+        debt = critical[0]
+        if active is None and not debt["sdd"]:
+            return f"leader: critical debt {debt['name']} comes first: run `harness debt start {debt['name']}`"
+        return f"leader: triage critical debt {debt['name']} with the human before other work"
+    if active:
+        return next_for_active(ctx, active, deep)
+    for feature in ctx.features:
+        name, status = feature["name"], feature["status"]
+        if status == "spec_ready":
+            shape = guard_spec_shape(ctx, feature)
+            if shape:
+                return f"spec_author: fix the spec of {name}: {shape[0]}"
+            if approval_errors(ctx, name):
+                return f"human: review .harness/specs/{name}/ and run `harness approve {name}`"
+            return f"leader: run `harness transition {name} in_progress`"
+        if status == "pending":
+            if feature["sdd"]:
+                return f"spec_author: write the spec for feature {name}"
+            return f"leader: run `harness transition {name} in_progress`"
+    blocked = [f for f in ctx.features if f["status"] == "blocked"]
+    if blocked:
+        name, origin = blocked[0]["name"], blocked[0]["blocked_from"]
+        return f"human: resolve blocked feature {name}, then run `harness transition {name} {origin} --as human`"
+    return "leader: no open work; take new intent from the human and decompose it into features"
+
+
+def cmd_checkpoints(args):
+    root = find_root()
+    text = render_checkpoints(load_rules(root))
+    if args.write:
+        (root / CHECKPOINTS).write_text(text, encoding="utf-8")
+        ok(f"wrote {CHECKPOINTS}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_next(args):
+    print(next_action(load_context(find_root())))
+    return 0
+
+
+# --- transition and approve ---------------------------------------------------
+
+
+def get_feature(ctx, name):
+    for feature in ctx.features:
+        if feature["name"] == name:
+            return feature
+    raise HarnessError(f"unknown feature: {name}")
+
+
+def match_transition(rules, feature, target):
+    for rule in rules["transitions"]:
+        if feature["status"] not in rule["from"]:
+            continue
+        if rule.get("when", {}).get("sdd", feature["sdd"]) != feature["sdd"]:
+            continue
+        destination = feature.get("blocked_from") if rule["to"] == "@previous" else rule["to"]
+        if destination == target:
+            return rule
+    return None
+
+
+def actor_allowed(rules, rule, actor):
+    if rule["actor"] == "any_agent":
+        return actor in rules["agents"]
+    return rule["actor"] == actor
+
+
+def transition_errors(ctx, feature, rule, reason=None):
+    errors = []
+    for guard in rule["guards"]:
+        errors += GUARDS[guard](ctx, feature, reason)
+    return unique(errors)
+
+
+def cmd_transition(args):
+    ctx = load_context(find_root())
+    feature = get_feature(ctx, args.feature)
+    rule = match_transition(ctx.rules, feature, args.state)
+    if rule is None:
+        raise HarnessError(f"illegal transition for {feature['name']}: {feature['status']} -> {args.state}")
+    if not actor_allowed(ctx.rules, rule, args.as_actor):
+        raise HarnessError(f"{feature['status']} -> {args.state} belongs to {rule['actor']}, not {args.as_actor}")
+    errors = transition_errors(ctx, feature, rule, args.reason)
+    if errors:
+        raise HarnessError("guards failed:\n  " + "\n  ".join(errors))
+
+    if args.as_actor == "human":
+        require_human(f"Move {feature['name']} from {feature['status']} to {args.state}")
+
+    previous = feature["status"]
+    if args.state == "done":
+        close_feature(ctx, feature)
+    else:
+        feature["status"] = args.state
+        if args.state == "blocked":
+            feature["blocked_from"] = previous
+            feature["blocked_reason"] = args.reason
+        else:
+            feature.pop("blocked_from", None)
+            feature.pop("blocked_reason", None)
+        write_json(ctx.root / FEATURES, ctx.features_doc)
+    ok(f"{feature['name']}: {previous} -> {args.state}")
+    return 0
+
+
+def get_debt(ctx, name):
+    for debt in ctx.debts:
+        if debt["name"] == name:
+            return debt
+    raise HarnessError(f"unknown debt: {name}")
+
+
+def match_debt_transition(rules, debt, target):
+    for rule in rules["debt"]["transitions"]:
+        if debt["status"] in rule["from"] and rule["to"] == target:
+            return rule
+    return None
+
+
+def move_debt(name, target):
+    ctx = load_context(find_root())
+    debt = get_debt(ctx, name)
+    rule = match_debt_transition(ctx.rules, debt, target)
+    if rule is None:
+        raise HarnessError(f"illegal move for debt {name}: {debt['status']} -> {target}")
+    errors = transition_errors(ctx, debt, rule)
+    if errors:
+        raise HarnessError("guards failed:\n  " + "\n  ".join(errors))
+    return ctx, debt
+
+
+def cmd_debt_start(args):
+    ctx, debt = move_debt(args.name, "in_progress")
+    previous = debt["status"]
+    debt["status"] = "in_progress"
+    write_json(ctx.root / DEBTS, ctx.debts_doc)
+    ok(f"debt {debt['name']}: {previous} -> in_progress")
+    return 0
+
+
+def cmd_debt_resolve(args):
+    ctx, debt = move_debt(args.name, "resolved")
+    evidence = evidence_hashes(*report_paths(ctx, debt))
+    write_json(ctx.root / DEBTS, resolving_document(ctx.debts_doc, debt["name"], evidence))
+    ok(f"debt {debt['name']}: in_progress -> resolved")
+    return 0
+
+
+def task_record(ctx):
+    path = ctx.root / TASKS
+    if not path.is_file():
+        return {"feature": None, "started": []}
+    record = load_json(path)
+    if not isinstance(record, dict) or not isinstance(record.get("started"), list):
+        raise HarnessError(f"{TASKS} must hold a started list")
+    return record
+
+
+def in_flight_tasks(ctx, item):
+    """Tasks started and not ticked. A damaged record is reported by `check`, not here."""
+    if is_debt(item) or not ctx.spec_path(item["name"], "tasks.md").is_file():
+        return []
+    try:
+        record = task_record(ctx)
+    except HarnessError:
+        return []
+    if record.get("feature") != item["name"]:
+        return []
+    open_ids = {t["id"] for t in parse_tasks(read_text(ctx.spec_path(item["name"], "tasks.md"))) if t["open"]}
+    return [entry for entry in record["started"] if entry.get("task") in open_ids]
+
+
+def append_log(ctx, entry):
+    path = ctx.progress_path("current.md")
+    text = read_text(path) if path.is_file() else ""
+    heading = re.search(r"^## Log[ \t]*$", text, re.MULTILINE)
+    if heading is None:
+        text = f"{text.rstrip()}\n\n## Log\n\n- {entry}\n"
+    else:
+        following = re.search(r"^## ", text[heading.end():], re.MULTILINE)
+        end = heading.end() + following.start() if following else len(text)
+        body = text[heading.end():end].replace("_—_", "").strip()
+        lines = f"{body}\n- {entry}" if body else f"- {entry}"
+        text = f"{text[:heading.end()]}\n\n{lines}\n\n{text[end:]}"
+    path.write_text(text, encoding="utf-8")
+
+
+def cmd_task_start(args):
+    ctx = load_context(find_root())
+    feature = get_feature(ctx, args.feature)
+    if feature["status"] != "in_progress":
+        raise HarnessError(f"feature {feature['name']} is {feature['status']}, not in_progress")
+    if not feature["sdd"]:
+        raise HarnessError(f"feature {feature['name']} has sdd false, so it has no tasks to start")
+    tasks = {t["id"]: t for t in parse_tasks(read_text(ctx.spec_path(feature["name"], "tasks.md")))}
+    if args.task not in tasks:
+        raise HarnessError(f"feature {feature['name']} has no task {args.task}")
+    if not tasks[args.task]["open"]:
+        raise HarnessError(f"task {args.task} of {feature['name']} is already ticked")
+    others = [e["task"] for e in in_flight_tasks(ctx, feature) if e.get("task") != args.task]
+    if others:
+        warn(f"{', '.join(others)} of {feature['name']} is still in flight: started, not ticked")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    record = task_record(ctx)
+    started = record["started"] if record.get("feature") == feature["name"] else []
+    started = [entry for entry in started if entry.get("task") != args.task]
+    started.append({"task": args.task, "started_at": now})
+    write_json(ctx.root / TASKS, {"feature": feature["name"], "started": started})
+    append_log(ctx, f"{now} task start {feature['name']} {args.task}")
+    ok(f"task {args.task} of {feature['name']} started")
+    return 0
+
+
+def close_feature(ctx, feature):
+    name = feature["name"]
+    features_doc, debts_doc = closing_documents(ctx.features_doc, ctx.debts_doc, name)
+    closed = next(f for f in features_doc["features"] if f["name"] == name)
+    closed["evidence"] = evidence_hashes(*report_paths(ctx, feature))
+    write_json_together([(ctx.root / FEATURES, features_doc), (ctx.root / DEBTS, debts_doc)])
+
+
+def cmd_approve(args):
+    ctx = load_context(find_root())
+    feature = get_feature(ctx, args.feature)
+    if not feature["sdd"]:
+        raise HarnessError(f"feature {feature['name']} has sdd false and needs no approval")
+    if feature["status"] not in ("spec_ready", "in_progress"):
+        raise HarnessError(f"feature {feature['name']} is {feature['status']}, nothing to approve")
+    missing = missing_spec_files(ctx, feature["name"])
+    if missing:
+        raise HarnessError(f"missing spec files: {', '.join(missing)}")
+    shape = guard_spec_shape(ctx, feature)
+    if shape:
+        raise HarnessError("the spec cannot be approved:\n  " + "\n  ".join(shape))
+    require_human(f"Approve the spec of {feature['name']}")
+    record = {
+        "feature": feature["name"],
+        "approved_by": approver_identity(),
+        "approved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "files": spec_fingerprint(ctx, feature["name"]),
+    }
+    write_json(ctx.approval_path(feature["name"]), record)
+    ok(f"approved spec of {feature['name']}")
+    return 0
+
+
+def cmd_evidence_restamp(args):
+    ctx = load_context(find_root())
+    feature = get_feature(ctx, args.feature)
+    if feature["status"] != "done" or "evidence" not in feature:
+        raise HarnessError(f"feature {feature['name']} is not closed, so it has no evidence to restamp")
+    current = evidence_hashes(*report_paths(ctx, feature))
+    if current == feature["evidence"]:
+        raise HarnessError(f"evidence of {feature['name']} already matches its reports")
+    require_human(f"Accept the changed reports of {feature['name']} as its evidence")
+    feature.setdefault("evidence_history", []).append({
+        "by": approver_identity(),
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "reason": args.reason,
+        "previous": feature["evidence"],
+    })
+    feature["evidence"] = current
+    write_json(ctx.root / FEATURES, ctx.features_doc)
+    ok(f"evidence of {feature['name']} restamped")
+    return 0
+
+
+# --- PreToolUse hook --------------------------------------------------------
+
+
+def glob_regex(pattern):
+    out, index = "", 0
+    pattern = pattern.casefold()
+    while index < len(pattern):
+        if pattern.startswith("**", index):
+            out += ".*"
+            index += 2
+        elif pattern[index] == "*":
+            out += "[^/]*"
+            index += 1
+        else:
+            out += re.escape(pattern[index])
+            index += 1
+    return re.compile(f"^{out}$")
+
+
+def matches_glob(patterns, rel):
+    return any(glob_regex(p).match(rel) for p in patterns)
+
+
+def relative_path(root, cwd, path):
+    """Casefolded project-relative path, or None outside the project.
+
+    Paths are folded because macOS and Windows treat .Harness and .harness as the
+    same directory, so every rule comparison must too.
+    """
+    full = os.path.realpath(os.path.join(cwd, path)).casefold()
+    base = os.path.realpath(str(root)).casefold()
+    if full == base:
+        return "."
+    if full.startswith(base + os.sep):
+        return full[len(base) + 1:]
+    return None
+
+
+def allowed_patterns(rules, role, active):
+    patterns = []
+    for pattern in rules["roles"][role]["allow"]:
+        if "{active}" not in pattern:
+            patterns.append(pattern)
+        elif active:
+            patterns.append(pattern.replace("{active}", active))
+    return patterns
+
+
+def closed_report(root, rel):
+    """Reports of closed work are hashed evidence: a later change belongs in a new report."""
+    report = re.fullmatch(r"\.harness/progress/(?:impl|review)_(.+)\.md", rel)
+    if report is None:
+        return False
+    try:
+        features = load_json(Path(root) / FEATURES).get("features", [])
+        debts = load_json(Path(root) / DEBTS).get("debts", [])
+    except (HarnessError, AttributeError):
+        return False
+    closed = {f.get("name", "").casefold() for f in features if f.get("status") == "done"}
+    closed |= {f"debt-{d.get('name', '')}".casefold() for d in debts if d.get("status") == "resolved"}
+    return report.group(1) in closed
+
+
+def write_denial(rules, role, active, rel, root):
+    if rel is None:
+        return None
+    if closed_report(root, rel):
+        return f"{rel} is evidence of closed work; record later changes in a new report"
+    if role in rules["roles"]:
+        if matches_glob(rules["roles"][role].get("deny", []), rel):
+            return f"role {role} may not write {rel}"
+        if matches_glob(allowed_patterns(rules, role, active), rel):
+            return None
+        return f"role {role} may not write {rel}"
+    if matches_glob(rules["unknown_role_allow"], rel):
+        return None
+    return f"agent {role} may not write {rel}"
+
+
+def simulate_edit(path, tool, tool_input):
+    """The file's text after this tool call, or None when that cannot be determined."""
+    if tool == "Write":
+        return tool_input.get("content", "")
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    edits = tool_input["edits"] if tool == "MultiEdit" else [tool_input]
+    for edit in edits:
+        old, new = edit.get("old_string", ""), edit.get("new_string", "")
+        if not old or old not in text:
+            return None
+        text = text.replace(old, new) if edit.get("replace_all") else text.replace(old, new, 1)
+    return text
+
+
+def feature_has_artifacts(root, name):
+    harness = Path(root) / HARNESS_DIR
+    paths = (harness / "specs" / name, harness / "approvals" / f"{name}.json",
+             harness / "progress" / f"impl_{name}.md", harness / "progress" / f"review_{name}.md")
+    return any(path.exists() for path in paths)
+
+
+def feature_list_denial(root, rules, current, proposed):
+    introduced = [e for e in validate_features(proposed, rules) if e not in validate_features(current, rules)]
+    if introduced:
+        return introduced[0]
+    before = {f.get("id"): f for f in current.get("features", [])}
+    after = {f.get("id"): f for f in proposed.get("features", [])}
+    after_names = {f.get("name"): f.get("id") for f in proposed.get("features", [])}
+    for key, feature in before.items():
+        name = feature.get("name")
+        if key not in after:
+            if feature.get("status") != "pending":
+                return f"feature {name} cannot be removed while {feature.get('status')}"
+            if name in after_names:
+                return f"id of {name} is immutable for agents"
+            continue
+        renamed = after[key].get("name")
+        if renamed != name and (feature.get("status") != "pending" or feature_has_artifacts(root, name)
+                                or feature_has_artifacts(root, renamed)):
+            return f"name of {name} is immutable once work exists; a human edits it directly"
+        if feature.get("sdd") != after[key].get("sdd"):
+            return f"sdd of {name} is immutable for agents; a human edits it directly"
+        for field in ("status", "blocked_from", "blocked_reason", "evidence", "evidence_history"):
+            if feature.get(field) != after[key].get(field):
+                return f"{field} of {name} changes only through `harness transition`"
+    for key, feature in after.items():
+        if key not in before and feature.get("status") != "pending":
+            return "new features must start as pending"
+    return None
+
+
+def debt_list_denial(current, proposed):
+    after = {d.get("id"): d for d in proposed.get("debts", [])}
+    before_ids = set()
+    for debt in current.get("debts", []):
+        before_ids.add(debt.get("id"))
+        if after.get(debt.get("id")) != debt:
+            return "existing debt entries are append-only for this role"
+    for key, debt in after.items():
+        if key not in before_ids and debt.get("status") != "open":
+            return "new debt entries must start as open"
+    return None
+
+
+def debt_hand_edit_denial(current, proposed):
+    """Status moves that carry a guard, and the fields those guards rely on, stay out of hand edits."""
+    before = {d.get("id"): d for d in current.get("debts", [])}
+    after = {d.get("id"): d for d in proposed.get("debts", [])}
+    for key, debt in before.items():
+        if key not in after:
+            return f"debt {debt.get('name')} cannot be removed: the ledger keeps every entry; use wontfix"
+    for key, debt in after.items():
+        old, name, status = before.get(key, {}), debt.get("name"), debt.get("status")
+        if status in ("in_progress", "resolved") and old.get("status") != status:
+            return f"debt {name} moves to {status} only through `harness debt` or its feature closing"
+        if old.get("severity") == "critical":
+            if debt.get("severity") != "critical":
+                return f"severity of critical debt {name} is lowered only by a human"
+            if status in ("accepted", "wontfix") and old.get("status") != status:
+                return f"critical debt {name} is accepted or dropped only by a human"
+        for field in ("evidence", "resolved_by"):
+            if old.get(field) != debt.get(field):
+                return f"{field} of debt {name} is written only by harness"
+        if old.get("status") == "in_progress":
+            for field in ("name", "acceptance", "sdd"):
+                if old.get(field) != debt.get(field):
+                    return f"{field} of debt {name} is frozen while it is being paid"
+    return None
+
+
+def state_edit_denial(root, rel, role, rules, tool, tool_input, path):
+    proposed_text = simulate_edit(path, tool, tool_input)
+    if proposed_text is None:
+        return f"cannot determine the result of this edit to {rel}"
+    try:
+        proposed = json.loads(proposed_text)
+        current = load_json(path) if Path(path).is_file() else {}
+    except (ValueError, HarnessError) as exc:
+        return f"edit to {rel} would leave invalid JSON: {exc}"
+    if rel == FEATURES.casefold():
+        return feature_list_denial(root, rules, current, proposed)
+    if rel == DEBTS.casefold():
+        if role in rules["debt"]["append_only_roles"]:
+            return debt_list_denial(current, proposed)
+        return debt_hand_edit_denial(current, proposed)
+    return None
+
+
+def tasks_edit_denial(path, tool, tool_input):
+    proposed = simulate_edit(path, tool, tool_input)
+    if proposed is None or not Path(path).is_file():
+        return None
+    current = Path(path).read_text(encoding="utf-8")
+    if normalize_tasks(proposed) != normalize_tasks(current):
+        return "the implementer may only tick tasks; spec changes need a new approval"
+    return None
+
+
+def active_name(root):
+    try:
+        for feature in load_json(Path(root) / FEATURES).get("features", []):
+            if feature.get("status") == "in_progress":
+                return feature.get("name")
+    except (HarnessError, AttributeError):
+        return None
+    return None
+
+
+def file_tool_denial(root, rules, role, payload):
+    tool = payload["tool_name"]
+    tool_input = payload.get("tool_input", {})
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not path:
+        return f"{tool} call has no target path"
+    cwd = payload.get("cwd") or str(root)
+    rel = relative_path(root, cwd, path)
+    active = active_name(root)
+    denial = write_denial(rules, role, active, rel, root)
+    if denial or rel is None:
+        return denial
+    full = os.path.join(cwd, path)
+    if rel in (FEATURES.casefold(), DEBTS.casefold()):
+        return state_edit_denial(root, rel, role, rules, tool, tool_input, full)
+    if role == "implementer" and rel.endswith("/tasks.md"):
+        return tasks_edit_denial(full, tool, tool_input)
+    return None
+
+
+SEPARATORS = {";", "|", "||", "&", "&&", "(", ")", "|&", ";;"}
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>", "<>", ">&"}
+READ_REDIRECTS = {"<", "<<", "<<<"}
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+WRAPPERS = {"sudo", "env", "command", "time", "nohup", "xargs", "exec"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+ALL_ARGS_WRITE = {"rm", "rmdir", "touch", "mkdir", "tee", "truncate", "unlink", "shred", "ed", "ex"}
+LAST_ARG_WRITE = {"cp", "ln", "install", "rsync", "scp", "ditto"}
+TARGET_DIRECTORY_COMMANDS = {"cp", "mv", "ln", "install"}
+COPY_COMMANDS = {"cp", "mv", "ln", "install", "rsync", "scp", "tar", "zip", "ditto"}
+FIND_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+PATCH_PATH = re.compile(r"^(?:\+\+\+|---) (?:[ab]/)?(\S+)|^diff --git a/(\S+) b/(\S+)", re.MULTILINE)
+FIRST_ARG_SKIPPED = {"chmod", "chown"}
+INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun"}
+PTY_WRAPPERS = {"script", "expect", "unbuffer", "socat", "screen", "tmux", "ptyexec"}
+TEXT_ONLY_COMMANDS = {"echo", "printf", "grep", "egrep", "rg", "cat", "ls", "git", "gh", "head", "tail", "wc"}
+CLI_PATHS = (".harness/bin/harness", ".harness/bin", ".harness")
+SENSITIVE = (".harness", ".claude", "feature_list.json", "techdebt_list.json")
+WRITE_INTENT = re.compile(
+    r"open\([^)]*,\s*(mode\s*=\s*)?f?['\"][^'\"]*[wax+]|(?<!stdout)(?<!stderr)\.write\(|write_text|write_bytes|"
+    r"writeFile|appendFile|\bdump\(|\b(rename|replace|unlink|remove|rmdir|truncate)\(|rmtree|"
+    r"shutil\.|copyFile|(^|\s)-\w*i\b")
+SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+
+
+def runs_its_input(line):
+    words = {os.path.basename(word) for word in re.findall(r"[\w./-]+", line)}
+    return any(word in SHELLS or word in INTERPRETERS or word.startswith("python3.") for word in words)
+
+
+def strip_data_heredocs(command):
+    """Heredoc text is data, unless a shell or interpreter on that line will run it."""
+    lines, kept, index = command.split("\n"), [], 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        opening = HEREDOC.search(line)
+        if not opening or runs_its_input(line):
+            continue
+        while index < len(lines) and lines[index].strip() != opening.group(2):
+            index += 1
+        index += 1
+    return "\n".join(kept)
+
+
+def tokenize(command):
+    command = re.sub(r"\$\(\s*pwd\s*\)|`\s*pwd\s*`", "$PWD", strip_data_heredocs(command))
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def split_simple_commands(tokens):
+    commands, current = [], []
+    for token in tokens:
+        if token in SEPARATORS:
+            if current:
+                commands.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def strip_redirects(words):
+    argv, targets, inputs, index = [], [], [], 0
+    while index < len(words):
+        word = words[index]
+        if word in WRITE_REDIRECTS:
+            if index + 1 < len(words) and not words[index + 1].isdigit():
+                targets.append(words[index + 1])
+            index += 2
+        elif word in READ_REDIRECTS:
+            if word == "<" and index + 1 < len(words):
+                inputs.append(words[index + 1])
+            index += 2
+        else:
+            argv.append(word)
+            index += 1
+    return argv, targets, inputs
+
+
+def expand(word, variables):
+    if word == "~" or word.startswith("~/"):
+        word = variables["HOME"] + word[1:]
+    return SHELL_VARIABLE.sub(lambda m: variables.get(m.group(1), m.group(0)), word)
+
+
+def unwrap(argv):
+    while argv and ASSIGNMENT.match(argv[0]):
+        argv = argv[1:]
+    while argv and os.path.basename(argv[0]) in WRAPPERS:
+        argv = argv[1:]
+        while argv and (argv[0].startswith("-") or "=" in argv[0]):
+            argv = argv[1:]
+    return argv
+
+
+def plain_args(argv):
+    return [a for a in argv[1:] if a and not a.startswith("-")]
+
+
+def sed_targets(argv):
+    if not any(re.match(r"^-[a-zA-Z]*i|^--in-place", a) for a in argv[1:]):
+        return []
+    explicit_script = any(a in ("-e", "-f") for a in argv[1:])
+    args, skip = [], False
+    for arg in argv[1:]:
+        if skip:
+            skip = False
+        elif arg in ("-e", "-f"):
+            skip = True
+        elif arg and not arg.startswith("-"):
+            args.append(arg)
+    return args if explicit_script else args[1:]
+
+
+def target_directory_operands(argv):
+    """Split `cp -t DIR a b` style arguments into (directory, sources)."""
+    directory, sources, index = None, [], 1
+    while index < len(argv):
+        word = argv[index]
+        if word in ("-t", "--target-directory") or re.match(r"^-[a-zA-Z]+t$", word):
+            directory = argv[index + 1] if index + 1 < len(argv) else None
+            index += 2
+            continue
+        if word.startswith("--target-directory="):
+            directory = word.split("=", 1)[1]
+        elif re.match(r"^-t.+", word):
+            directory = word[2:]
+        elif word and not word.startswith("-"):
+            sources.append(word)
+        index += 1
+    return directory, sources
+
+
+def copy_operands(argv):
+    """(sources, destinations) of a copy-like command."""
+    name = os.path.basename(argv[0])
+    if name in TARGET_DIRECTORY_COMMANDS:
+        directory, sources = target_directory_operands(argv)
+        if directory is not None:
+            return sources, [os.path.join(directory, os.path.basename(s)) for s in sources] or [directory]
+    plain = plain_args(argv)
+    return plain[:-1], plain[-1:]
+
+
+def patch_file_paths(cwd, filename):
+    """Paths a patch file touches, or None when it cannot be read."""
+    try:
+        text = Path(cwd, filename).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    paths = {path for match in PATCH_PATH.findall(text) for path in match if path}
+    return sorted(paths - {"/dev/null"})
+
+
+def patch_targets(cwd, patch_file):
+    paths = patch_file_paths(cwd, patch_file) if patch_file else None
+    return ["."] if paths is None else paths
+
+
+def patch_command_targets(argv, cwd, inputs):
+    source = inputs[0] if inputs else None
+    plain = []
+    args = iter(argv[1:])
+    for word in args:
+        if word in ("-i", "--input"):
+            source = next(args, None)
+        elif word in ("-d", "--directory", "-p", "--strip", "-o", "--output", "-r", "-B", "-F"):
+            next(args, None)
+        elif word.startswith("--input="):
+            source = word.split("=", 1)[1]
+        elif word and not word.startswith("-"):
+            plain.append(word)
+    if source is None and plain:
+        source = plain[-1]
+        plain = plain[:-1]
+    return plain + patch_targets(cwd, source)
+
+
+def git_apply_targets(rest, cwd, inputs):
+    if any(flag in rest for flag in ("--check", "--stat", "--numstat", "--summary")):
+        return []
+    files = [word for word in rest if word and not word.startswith("-")] + inputs
+    return patch_targets(cwd, files[0] if files else None)
+
+
+def split_git_command(argv, cwd):
+    """(subcommand, arguments, cwd) after git's global options."""
+    args = argv[1:]
+    while args and args[0].startswith("-"):
+        if args[0] == "-C" and len(args) > 1:
+            cwd = os.path.join(cwd, args[1])
+        args = args[2:] if args[0] in GIT_VALUE_OPTIONS else args[1:]
+    return (args[0] if args else None), args[1:], cwd
+
+
+def paths_after_separator(rest):
+    return rest[rest.index("--") + 1:] if "--" in rest else None
+
+
+def git_checkout_targets(rest, cwd):
+    explicit = paths_after_separator(rest)
+    if explicit is not None:
+        return explicit
+    return [word for word in rest if word and not word.startswith("-") and os.path.exists(os.path.join(cwd, word))]
+
+
+def git_restore_targets(rest):
+    if "--staged" in rest and "--worktree" not in rest and "-W" not in rest:
+        return []
+    explicit = paths_after_separator(rest)
+    if explicit is not None:
+        return explicit
+    paths, skip = [], False
+    for word in rest:
+        if skip:
+            skip = False
+        elif word in ("-s", "--source"):
+            skip = True
+        elif word and not word.startswith("-"):
+            paths.append(word)
+    return paths
+
+
+def git_targets(argv, cwd, inputs):
+    """Paths a git command rewrites. "." stands for the whole work tree."""
+    subcommand, rest, cwd = split_git_command(argv, cwd)
+    paths = []
+    if subcommand in ("rm", "mv"):
+        paths = [word for word in rest if word and not word.startswith("-")]
+    elif subcommand == "reset" and "--hard" in rest:
+        paths = ["."]
+    elif subcommand == "clean" and not any(re.match(r"^-[a-zA-Z]*n|^--dry-run", word) for word in rest):
+        explicit = paths_after_separator(rest)
+        if explicit is None:
+            explicit = [word for word in rest if word and not word.startswith("-")]
+        paths = explicit or ["."]
+    elif subcommand == "checkout":
+        paths = git_checkout_targets(rest, cwd)
+    elif subcommand == "restore":
+        paths = git_restore_targets(rest)
+    elif subcommand == "apply":
+        paths = git_apply_targets(rest, cwd, inputs)
+    return [contents_of(cwd, path) for path in paths]
+
+
+def contents_of(cwd, path):
+    """A folder stands for what is inside it, which is what git rewrites."""
+    full = os.path.join(cwd, path)
+    return os.path.join(full, "found") if os.path.isdir(full) else full
+
+
+def command_targets(argv, cwd, inputs):
+    name = os.path.basename(argv[0])
+    if name in ALL_ARGS_WRITE:
+        return plain_args(argv)
+    if name == "mv":
+        sources, destinations = copy_operands(argv)
+        return sources + destinations
+    if name in LAST_ARG_WRITE:
+        return copy_operands(argv)[1]
+    if name in FIRST_ARG_SKIPPED:
+        # A mode such as -x looks like a flag, so only real options are dropped.
+        return [a for a in argv[1:] if not re.match(r"^-[RfvhHLP]+$", a)][1:]
+    if name in ("sed", "gsed", "awk", "gawk"):
+        return sed_targets(argv)
+    if name == "git":
+        return git_targets(argv, cwd, inputs)
+    if name == "patch":
+        return patch_command_targets(argv, cwd, inputs)
+    if name == "dd":
+        return [a[3:] for a in argv[1:] if a.startswith("of=")]
+    return []
+
+
+def find_search_paths(argv):
+    paths = []
+    for word in argv[1:]:
+        if word.startswith("-") or word in ("(", "!"):
+            break
+        paths.append(word)
+    return paths or ["."]
+
+
+def find_exec_commands(argv):
+    """Each -exec command of a find call, with {} standing for a found file."""
+    commands, index = [], 1
+    while index < len(argv):
+        if argv[index] in FIND_EXEC_FLAGS:
+            index += 1
+            command = []
+            while index < len(argv) and argv[index] not in (";", "+"):
+                command.append(argv[index])
+                index += 1
+            commands.append(command)
+        index += 1
+    return commands
+
+
+def find_denial(policy, argv, cwd, variables):
+    paths = find_search_paths(argv)
+    if "-delete" in argv:
+        for path in paths:
+            denial = target_denial(policy, cwd, os.path.join(path, "found"))
+            if denial:
+                return denial
+    for command in find_exec_commands(argv):
+        for path in paths:
+            filled = [word.replace("{}", os.path.join(path, "found")) for word in command]
+            denial = bash_denial_for(policy, shlex.join(filled), cwd, variables)
+            if denial:
+                return denial
+    return None
+
+
+class OnceOnly(argparse.Action):
+    """An option that may appear once, so no spelling can override an earlier value."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        marker = f"_{self.dest}_seen"
+        if getattr(namespace, marker, False):
+            parser.error(f"{option_string} may only be given once")
+        setattr(namespace, marker, True)
+        setattr(namespace, self.dest, values)
+
+
+def is_cli_word(word):
+    return os.path.basename(word).casefold() == "harness" or ".harness/bin" in word.casefold()
+
+
+def harness_subcommand(argv):
+    for index, word in enumerate(argv[:-1]):
+        if is_cli_word(word):
+            return argv[index + 1:]
+    return None
+
+
+def parsed_call(call):
+    """The arguments the CLI itself would see, or None when it would reject the call."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            return build_parser().parse_args(call)
+    except SystemExit:
+        return None
+
+
+def runs_approve(argv, name):
+    """True when `approve` here can reach the CLI, not when it is merely an argument."""
+    if "approve" not in argv[1:] or name in TEXT_ONLY_COMMANDS:
+        return False
+    if any(is_cli_word(word) for word in argv) or "$" in argv[0] or name in PTY_WRAPPERS:
+        return True
+    # A renamed CLI keeps `approve` in the subcommand position.
+    is_interpreter = name in INTERPRETERS or name.startswith("python3.")
+    return argv[1] == "approve" or (is_interpreter and argv[2:3] == ["approve"])
+
+
+def harness_call_denial(policy, argv):
+    role = policy.role
+    name = os.path.basename(argv[0])
+    if runs_approve(argv, name):
+        return "`harness approve` is human only"
+    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints", "sandbox", "evidence"} & set(argv[1:]):
+        return "the CLI cannot be run through an unresolved variable"
+    call = harness_subcommand(argv)
+    if not call:
+        return None
+    if "$" in call[0]:
+        return "harness subcommands cannot be hidden in an unresolved variable"
+    if call[0] == "transition":
+        parsed = parsed_call(call)
+        actor = parsed.as_actor if parsed else None
+        if actor != role:
+            return f"role {role} cannot run this transition as {actor or 'an unparsable actor'}"
+    if call[0] == "checkpoints":
+        parsed = parsed_call(call)
+        if parsed is None or parsed.write:
+            return "`harness checkpoints --write` is human only"
+    allowed = policy.rules["command_roles"].get(call[0])
+    if allowed is not None and role not in allowed:
+        return f"role {role} may not run `harness {call[0]}`"
+    return None
+
+
+def skill_install_denial(argv):
+    """Skills reach a project through `harness update`, never through an unattended install."""
+    name = os.path.basename(argv[0])
+    args = plain_args(argv)
+    if name in SKILL_RUNNERS and args[:1] in (["dlx"], ["exec"]):
+        args = args[1:]
+    if name != "skills":
+        if name not in SKILL_RUNNERS or not args or not re.match(r"^skills(@.*)?$", args[0]):
+            return None
+        args = args[1:]
+    if args[:1] and args[0] in SKILL_MUTATIONS:
+        return "agents may not install skills; a human ships them through `harness update`"
+    return None
+
+
+def mentions_cli(text):
+    return "harness" in text.casefold() or "approve" in text.casefold()
+
+
+def cli_copy_denial(root, cwd, argv, redirects):
+    name = os.path.basename(argv[0])
+    if name not in COPY_COMMANDS and not redirects:
+        return None
+    sources = copy_operands(argv)[0] if name in LAST_ARG_WRITE | TARGET_DIRECTORY_COMMANDS else plain_args(argv)
+    for source in sources:
+        if relative_path(root, cwd, source) in CLI_PATHS:
+            return "the harness CLI cannot be copied"
+    return None
+
+
+def wrapper_denial(name, argv, command):
+    text = " ".join(argv[1:])
+    if name in PTY_WRAPPERS and mentions_cli(text):
+        return f"{name} cannot wrap the harness CLI"
+    if name in INTERPRETERS or name.startswith("python3."):
+        script = command if "<<" in command else text
+        if "harness" in script.casefold() and re.search(r"\bpty\b|\bapprove\b", script):
+            return "interpreters cannot drive `harness approve`"
+        if any(s in script for s in SENSITIVE) and WRITE_INTENT.search(script):
+            return "scripted writes to harness files are not allowed; use the Write or Edit tool, which the hook validates"
+    if name in SHELLS and "-c" not in argv and not plain_args(argv) and mentions_cli(command):
+        return "commands that mention the harness cannot be piped into a shell"
+    return None
+
+
+class Policy:
+    """Everything a Bash decision depends on."""
+
+    def __init__(self, root, rules, config, role, active):
+        self.root = root
+        self.rules = rules
+        self.role = role
+        self.active = active
+        self.generated = [str(p).casefold() for p in config.get("generated_paths", [])]
+
+    def write_denial(self, rel):
+        return write_denial(self.rules, self.role, self.active, rel, self.root)
+
+    def may_write_generated(self, rel):
+        role = self.rules["roles"].get(self.role, {})
+        if not role.get("generated_paths") or set(rel.split("/")) & RESERVED_DIRS:
+            return False
+        return any(rel == path or rel.startswith(path + "/") for path in self.generated)
+
+
+def target_denial(policy, cwd, target):
+    if "$" in target:
+        remainder = os.path.normpath(SHELL_VARIABLE.sub("", target).lstrip("/")).casefold()
+        if matches_glob(policy.rules["protected"], remainder):
+            return policy.write_denial(remainder)
+        return None
+    rel = relative_path(policy.root, cwd, target)
+    if rel is not None and rel.startswith(".harness/state/"):
+        return "state files change through Write/Edit or `harness transition`, not Bash"
+    if rel is not None and policy.may_write_generated(rel):
+        return None
+    return policy.write_denial(rel)
+
+
+def bash_denial_for(policy, command, cwd, variables=None):
+    variables = dict(variables or {})
+    variables.setdefault("HOME", os.path.expanduser("~"))
+    variables["CLAUDE_PROJECT_DIR"] = str(policy.root)
+    try:
+        tokens = tokenize(command)
+    except ValueError:
+        if any(s in command for s in SENSITIVE) and WRITE_INTENT.search(command):
+            return "command could not be parsed and appears to modify harness files"
+        if "approve" in command and "harness" in command.casefold():
+            return "command could not be parsed and appears to run `harness approve`"
+        return None
+    for words in split_simple_commands(tokens):
+        variables["PWD"] = cwd
+        words = [expand(word, variables) for word in words]
+        if all(ASSIGNMENT.match(word) for word in words):
+            variables.update(ASSIGNMENT.match(word).groups() for word in words)
+            continue
+        argv, targets, inputs = strip_redirects(words)
+        redirected = any(target != "/dev/null" for target in targets)
+        argv = unwrap(argv)
+        name = os.path.basename(argv[0]) if argv else ""
+        if name == "cd" and len(argv) > 1:
+            cwd = os.path.join(cwd, argv[1])
+            continue
+        denial = nested_command_denial(policy, name, argv, cwd, variables)
+        if denial:
+            return denial
+        if argv:
+            denial = (harness_call_denial(policy, argv)
+                      or skill_install_denial(argv)
+                      or cli_copy_denial(policy.root, cwd, argv, redirected)
+                      or wrapper_denial(name, argv, command))
+            if denial:
+                return denial
+            targets = targets + command_targets(argv, cwd, inputs)
+        for target in targets:
+            denial = target_denial(policy, cwd, target)
+            if denial:
+                return denial
+    return None
+
+
+def nested_command_denial(policy, name, argv, cwd, variables):
+    if name in SHELLS and "-c" in argv and argv.index("-c") + 1 < len(argv):
+        return bash_denial_for(policy, argv[argv.index("-c") + 1], cwd, variables)
+    if name == "eval":
+        return bash_denial_for(policy, " ".join(argv[1:]), cwd, variables)
+    if name == "find":
+        return find_denial(policy, argv, cwd, variables)
+    return None
+
+
+def hook_decide(root, payload):
+    config = load_config(root)
+    if config["stack"] is None:
+        return None  # Uninitialized scaffold: this is harness development.
+    rules = load_rules(root)
+    agent = payload.get("agent_type")
+    role = agent if agent else "leader"
+    tool = payload.get("tool_name")
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        return file_tool_denial(root, rules, role, payload)
+    if tool == "Bash":
+        command = payload.get("tool_input", {}).get("command", "")
+        cwd = payload.get("cwd") or str(root)
+        return bash_denial_for(Policy(root, rules, config, role, active_name(root)), command, cwd)
+    return None
+
+
+def session_start_context(root):
+    """The briefing to inject, or None when the hook must stay passive."""
+    if load_config(root)["stack"] is None:
+        return None
+    return render_briefing(build_briefing(load_context(root)))
+
+
+def hook_session_start():
+    """SessionStart must never get in the way: every failure ends in exit 0 with a note."""
+    try:
+        context = session_start_context(SOURCE_ROOT)
+    except Exception as exc:
+        context = f"harness: session briefing unavailable: {exc}. Run `harness check`."
+    if context is not None:
+        output = {"hookEventName": "SessionStart", "additionalContext": context[:HOOK_CONTEXT_LIMIT]}
+        print(json.dumps({"hookSpecificOutput": output}))
+    return 0
+
+
+def cmd_hook(args):
+    if args.event == "session-start":
+        return hook_session_start()
+    try:
+        payload = json.loads(sys.stdin.read())
+        denial = hook_decide(SOURCE_ROOT, payload)
+    except Exception as exc:  # Any doubt about the rules must block, never allow.
+        print(f"harness: blocked (fail closed): {exc}", file=sys.stderr)
+        return 2
+    if denial:
+        print(f"harness: blocked: {denial}", file=sys.stderr)
+        return 2
+    return 0
+
+
+# --- resume -----------------------------------------------------------------
+
+
+def capped(items, limit):
+    return {"items": items[:limit], "omitted": max(0, len(items) - limit)}
+
+
+def changed_files(ctx):
+    """Changed and untracked paths under the app, or a note when git cannot say."""
+    command = ["git", "-C", str(ctx.root), "status", "--porcelain", "--untracked-files=all", "--",
+               ctx.config["app_dir"]]
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                errors="replace", stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT_SECONDS)
+    except OSError:
+        return [], "git is not available"
+    except subprocess.TimeoutExpired:
+        return [], "git status timed out"
+    if result.returncode != 0:
+        return [], "not a git repository"
+    return [line.rstrip() for line in result.stdout.splitlines()], None
+
+
+def log_lines(ctx):
+    path = ctx.progress_path("current.md")
+    if not path.is_file():
+        return []
+    heading = re.search(r"^## Log[ \t]*$", read_text(path), re.MULTILINE)
+    if heading is None:
+        return []
+    section = re.split(r"^## ", read_text(path)[heading.end():], maxsplit=1, flags=re.MULTILINE)[0]
+    return [line.strip() for line in section.splitlines() if line.strip() and line.strip() != "_—_"]
+
+
+def task_summary(ctx, item):
+    if is_debt(item) or not ctx.spec_path(item["name"], "tasks.md").is_file():
+        return None
+    tasks = parse_tasks(read_text(ctx.spec_path(item["name"], "tasks.md")))
+    return {"done": capped([t["line"] for t in tasks if not t["open"]], BRIEFING_LIST_CAP),
+            "pending": capped([t["line"] for t in tasks if t["open"]], BRIEFING_LIST_CAP),
+            "in_flight": capped(in_flight_tasks(ctx, item), BRIEFING_LIST_CAP)}
+
+
+def read_next_files(ctx, item):
+    files = []
+    if not is_debt(item) and ctx.spec_path(item["name"], "tasks.md").is_file():
+        files += [f".harness/specs/{item['name']}/{name}" for name in SPEC_FILES]
+    files += [f".harness/progress/{path.name}" for path in report_paths(ctx, item) if path.is_file()]
+    return files + [".harness/progress/current.md"]
+
+
+def review_summary(ctx, item):
+    review = report_paths(ctx, item)[1]
+    if not review.is_file():
+        return None
+    return {"path": f".harness/progress/{review.name}", "verdict": latest_verdict(review)}
+
+
+def build_briefing(ctx):
+    """State only: this must stay fast, so no test and no slow guard runs here."""
+    item = ctx.active_work()
+    action = next_action(ctx, deep=False)
+    briefing = {"project": ctx.config["project"], "active": None, "next_action": action,
+                "next_may_differ": "harness transition" in action and " done`" in action
+                or "harness debt resolve" in action}
+    if item is None:
+        return briefing
+    files, note = changed_files(ctx)
+    has_spec = not is_debt(item) and ctx.spec_path(item["name"], "tasks.md").is_file()
+    briefing.update({
+        "active": {"kind": "debt" if is_debt(item) else "feature", "name": item["name"],
+                   "title": item["title"], "status": item["status"]},
+        "tasks": task_summary(ctx, item),
+        "spec_path": f".harness/specs/{item['name']}/" if has_spec else None,
+        "review": review_summary(ctx, item),
+        "changed_files": capped(files, BRIEFING_LIST_CAP),
+        "changed_files_note": note,
+        "log": {"items": log_lines(ctx)[-BRIEFING_LOG_CAP:],
+                "omitted": max(0, len(log_lines(ctx)) - BRIEFING_LOG_CAP)},
+        "read_next": capped(read_next_files(ctx, item), BRIEFING_LIST_CAP),
+    })
+    return briefing
+
+
+def render_list(title, listing):
+    lines = [f"{title}:"] if listing["items"] else []
+    lines += [f"  {entry}" for entry in listing["items"]]
+    if listing["omitted"]:
+        lines.append(f"  ... {listing['omitted']} more omitted")
+    return lines
+
+
+def render_briefing(briefing):
+    next_line = f"Next action (state only, tests not run): {briefing['next_action']}"
+    active = briefing["active"]
+    if active is None:
+        return f"Harness: no active work in {briefing['project']}.\n{next_line}"
+    lines = [f"Harness briefing for {briefing['project']}",
+             f"Active {active['kind']}: {active['name']} ({active['status']}) - {active['title']}"]
+    tasks = briefing["tasks"]
+    if tasks:
+        done, pending = tasks["done"], tasks["pending"]
+        lines.append(f"Tasks: {len(done['items']) + done['omitted']} done, "
+                     f"{len(pending['items']) + pending['omitted']} pending")
+        flying = [f"{e.get('task')} (started {e.get('started_at')})" for e in tasks["in_flight"]["items"]]
+        lines += render_list("In flight, started and not finished",
+                             {"items": flying, "omitted": tasks["in_flight"]["omitted"]})
+        lines += render_list("Pending tasks", pending)
+    if briefing["spec_path"]:
+        lines.append(f"Spec: {briefing['spec_path']}")
+    review = briefing["review"]
+    lines.append(f"Latest review: {review['verdict']} ({review['path']})" if review else "Latest review: none")
+    if briefing["changed_files_note"]:
+        lines.append(f"Changed files: unknown, {briefing['changed_files_note']}")
+    else:
+        lines += render_list("Changed under the app", briefing["changed_files"]) or ["Changed under the app: none"]
+    lines += render_list("Recent log", briefing["log"])
+    lines += render_list("Read next", briefing["read_next"])
+    lines.append(next_line)
+    if briefing["next_may_differ"]:
+        lines.append("This briefing skips tests and slow guards, so `harness next` may route elsewhere.")
+    return "\n".join(line[:BRIEFING_LINE_WIDTH] for line in lines)
+
+
+def cmd_resume(args):
+    briefing = build_briefing(load_context(find_root()))
+    print(json.dumps(briefing, indent=2, ensure_ascii=False) if args.json else render_briefing(briefing))
+    return 0
+
+
+# --- init -------------------------------------------------------------------
+
+
+def slugify(text):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "app"
+
+
+def stacks_dir():
+    return SOURCE_ROOT / HARNESS_DIR / "stacks"
+
+
+def load_stack(name):
+    path = stacks_dir() / name / "stack.json"
+    if not path.is_file():
+        available = ", ".join(sorted(p.parent.name for p in stacks_dir().glob("*/stack.json")))
+        raise HarnessError(f"unknown stack: {name} (available: {available})")
+    return load_json(path)
+
+
+def missing_tools(stack):
+    missing = []
+    for alternatives in stack.get("requires", []):
+        if not any(shutil.which(tool) for tool in alternatives):
+            missing.append(" or ".join(alternatives))
+    return missing
+
+
+def directory_has_content(path):
+    if not path.is_dir():
+        return False
+    return any(entry.name not in (".gitkeep", ".DS_Store") for entry in path.iterdir())
+
+
+def read_target_config(target):
+    path = target / CONFIG
+    if not path.is_file():
+        return None
+    config = load_json(path)
+    if not isinstance(config, dict):
+        raise HarnessError(f"{path} must be a JSON object")
+    return config
+
+
+def load_valid_stack(name):
+    stack = load_stack(name)
+    if not isinstance(stack, dict):
+        raise HarnessError(f"stack {name}: stack.json must be a JSON object")
+    errors = generated_path_errors(stack.get("generated", []), f"stack {name}")
+    if errors:
+        raise HarnessError("; ".join(errors))
+    return stack
+
+
+def preflight(stack_name, stack, target):
+    missing = missing_tools(stack)
+    if not shutil.which("git"):
+        missing.append("git")
+    if missing:
+        raise HarnessError(f"stack {stack_name} needs tools that are not installed: {', '.join(missing)}")
+    for candidate in [target, *target.parents]:
+        if candidate.exists():
+            if not candidate.is_dir():
+                raise HarnessError(f"{candidate} is not a directory")
+            break
+    config = read_target_config(target)
+    if config is not None and config.get("stack") is not None:
+        raise HarnessError(f"{target} is already initialized")
+    if (target / "src").exists() and not (target / "src").is_dir():
+        raise HarnessError(f"{target / 'src'} is not a directory")
+    if directory_has_content(target / "src"):
+        raise HarnessError(f"{target / 'src'} is not empty; refusing to overwrite it")
+    if config is None:
+        conflicts = [target / HARNESS_DIR]
+        conflicts += [target / p.relative_to(SOURCE_ROOT) for p in (SOURCE_ROOT / ".claude").rglob("*")
+                      if p.is_file()]
+        for path in conflicts:
+            if path.exists():
+                raise HarnessError(f"{path} already exists; refusing to overwrite it")
+
+
+def undo_entry(entry):
+    path, kind = Path(entry["path"]), entry["kind"]
+    if kind == "saved":
+        data = base64.b64decode(entry["data"])
+        if not path.is_file() or path.read_bytes() != data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+    elif kind == "tree" and path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    elif kind in ("file", "tree") and (path.exists() or path.is_symlink()):
+        path.unlink()
+    elif kind == "dir":
+        remove_if_empty(path)
+
+
+def undo_entries(entries):
+    """Undo every entry, even past a failure, so one stuck path cannot strand the rest."""
+    failures = []
+    for entry in reversed(entries):
+        try:
+            undo_entry(entry)
+        except OSError as exc:
+            failures.append(str(exc))
+    if failures:
+        raise HarnessError("rollback is incomplete:\n  " + "\n  ".join(failures))
+
+
+def remove_if_empty(path):
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def undo_and_forget(target, entries):
+    """Undo a run. Directories go last, because the manifest lives inside the target."""
+    undo_entries(entries)
+    with contextlib.suppress(FileNotFoundError):
+        (target / MANIFEST).unlink()
+    for entry in reversed(entries):
+        if entry["kind"] == "dir":
+            remove_if_empty(Path(entry["path"]))
+
+
+class InitRun:
+    """A write-ahead record of what this run changes.
+
+    Each change is listed before it happens, so a failure, or a later run after
+    SIGKILL, undoes exactly the listed paths and nothing else.
+    """
+
+    def __init__(self, target):
+        self.target = target
+        self.entries = []
+        self.known = set()
+
+    def note(self, path, kind, **extra):
+        self.known.add(Path(path))
+        self.entries.append({"path": str(path), "kind": kind, **extra})
+        if self.target.is_dir():
+            write_json(self.target / MANIFEST, {"entries": self.entries})
+
+    def track(self, path, kind="file"):
+        path = Path(path)
+        if path in self.known:
+            return
+        if path.is_file():
+            self.note(path, "saved", data=base64.b64encode(path.read_bytes()).decode("ascii"))
+        elif not path.exists():
+            self.note(path, kind)
+
+    def make_dirs(self, path):
+        missing = []
+        path = Path(path)
+        while not path.exists():
+            missing.append(path)
+            path = path.parent
+        for directory in reversed(missing):
+            self.note(directory, "dir")
+            directory.mkdir()
+
+    def write(self, path, text):
+        self.track(path)
+        Path(path).write_text(text, encoding="utf-8")
+
+    def copy_file(self, source, destination):
+        self.make_dirs(Path(destination).parent)
+        self.track(destination)
+        shutil.copy2(source, destination)
+
+    def copy_tree(self, source, destination):
+        self.make_dirs(destination)
+        for path in sorted(Path(source).rglob("*")):
+            if path.is_file() and not set(path.parts) & GENERATED_NAMES:
+                self.copy_file(path, Path(destination) / path.relative_to(source))
+
+    def rollback(self):
+        undo_and_forget(self.target, self.entries)
+
+    def finish(self):
+        with contextlib.suppress(FileNotFoundError):
+            (self.target / MANIFEST).unlink()
+
+
+def read_manifest(target):
+    data = load_json(target / MANIFEST)
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise HarnessError(f"{target / MANIFEST} is not a valid init manifest; inspect it and remove it by hand")
+    for entry in entries:
+        path = Path(entry.get("path", "")) if isinstance(entry, dict) else Path()
+        inside = path == target or target in path.parents
+        created_parent = path in target.parents and entry.get("kind") == "dir"
+        if not (inside or created_parent) or entry.get("kind") not in ("file", "dir", "tree", "saved"):
+            raise HarnessError(f"{target / MANIFEST} lists {path}, outside this run; remove it by hand")
+    return entries
+
+
+def recover_interrupted_init(target):
+    if not (target / MANIFEST).is_file():
+        return
+    entries = read_manifest(target)
+    config = read_target_config(target)
+    if config is not None and config.get("stack") is not None:
+        warn(f"a previous init finished its last step; removing its manifest in {target}")
+        (target / MANIFEST).unlink()
+        return
+    warn(f"found an interrupted init in {target}: rolling back the {len(entries)} changes it listed")
+    undo_and_forget(target, entries)
+
+
+class InitInterrupted(HarnessError):
+    pass
+
+
+@contextlib.contextmanager
+def signals_raise():
+    """Turn SIGTERM and SIGHUP into exceptions so that rollback runs."""
+
+    def interrupted(number, frame):
+        raise InitInterrupted(f"init interrupted by {signal.Signals(number).name}; its changes were rolled back")
+
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def substitute(value, values):
+    for key, replacement in values.items():
+        value = value.replace("{{" + key + "}}", replacement)
+    return value
+
+
+def run_step(step, stage, values):
+    command = step["run"]
+    if not shutil.which(command[0]) and step.get("fallback"):
+        command = step["fallback"]
+    command = [substitute(part, values) for part in command]
+    cwd = stage / "src" if step.get("cwd") == "src" else stage
+    print(f"  $ {' '.join(command)}")
+    try:
+        result = subprocess.run(command, cwd=str(cwd), stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        raise HarnessError(f"scaffold step could not start: {' '.join(command)}: {exc}")
+    if result.returncode != 0:
+        raise HarnessError(f"scaffold step failed (exit {result.returncode}): {' '.join(command)}")
+    if step.get("hoist"):
+        generated = stage / substitute(step["hoist"], values)
+        for entry in generated.iterdir():
+            shutil.move(str(entry), str(stage / "src" / entry.name))
+        generated.rmdir()
+
+
+def copy_scaffold_files(stack_name, stage, values):
+    source = stacks_dir() / stack_name / "scaffold"
+    if not source.is_dir():
+        return
+    for path in sorted(source.rglob("*")):
+        if path.is_dir() or "__pycache__" in path.parts:
+            continue
+        destination = stage / "src" / path.relative_to(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(substitute(path.read_text(encoding="utf-8"), values), encoding="utf-8")
+
+
+def build_app(stack_name, stack, target, values, run):
+    """Scaffold into a private staging folder so a failure leaves the target untouched."""
+    stage = Path(tempfile.mkdtemp(prefix=".harness-init-", dir=str(target)))
+    run.note(stage, "tree")
+    (stage / "src").mkdir()
+    try:
+        for step in stack.get("scaffold", []):
+            run_step(step, stage, values)
+        copy_scaffold_files(stack_name, stage, values)
+        destination = target / "src"
+        run.make_dirs(destination)
+        keep = destination / ".gitkeep"
+        generated = list((stage / "src").iterdir())
+        if keep.exists() and generated:
+            run.track(keep)
+            keep.unlink()
+        for entry in generated:
+            run.track(destination / entry.name, kind="tree")
+            shutil.move(str(entry), str(destination / entry.name))
+        if not generated and not keep.exists():
+            run.track(keep)
+            keep.touch()
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def copy_harness(source, target, stack_name, run):
+    run.copy_tree(source / ".claude", target / ".claude")
+    run.make_dirs(target / HARNESS_DIR)
+    for entry in (source / HARNESS_DIR).iterdir():
+        if entry.name in NOT_COPIED:
+            continue
+        destination = target / HARNESS_DIR / entry.name
+        if entry.is_dir():
+            run.copy_tree(entry, destination)
+        else:
+            run.copy_file(entry, destination)
+    for path in stack_runtime_files(source, stack_name):
+        run.copy_file(path, target / path.relative_to(source))
+    for name in RUNTIME_TEMPLATES:
+        run.copy_file(source / HARNESS_DIR / "templates" / name, target / HARNESS_DIR / "templates" / name)
+    for folder in ("approvals", "specs", "state", "progress"):
+        path = target / HARNESS_DIR / folder
+        run.make_dirs(path)
+        if folder in ("approvals", "specs") and not (path / ".gitkeep").exists():
+            run.write(path / ".gitkeep", "")
+
+
+def merge_gitignore(source, target, stack_name, stack, run):
+    path = target / ".gitignore"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    lines = (source / ".gitignore").read_text(encoding="utf-8").splitlines()
+    lines += [f"# stack: {stack_name}"] + stack.get("gitignore", [])
+    present = set(existing.splitlines())
+    additions = [line for line in lines if line and line not in present]
+    if additions:
+        prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+        run.write(path, prefix + "\n".join(additions) + "\n")
+
+
+def is_scaffold_readme(path, target):
+    data = path.read_bytes()
+    if README_MARKER in data:
+        return True
+    shipped = SOURCE_ROOT / "README.md"
+    return SOURCE_ROOT != target and shipped.is_file() and shipped.read_bytes() == data
+
+
+def render_template(source, name, values):
+    return substitute((source / HARNESS_DIR / "templates" / name).read_text(encoding="utf-8"), values)
+
+
+def write_project_files(source, target, stack_name, values, in_place, run):
+    harness = target / HARNESS_DIR
+    for name, relative in (("feature_list.json", "state/feature_list.json"),
+                           ("techdebt_list.json", "state/techdebt_list.json"),
+                           ("tasks.json", "state/tasks.json"),
+                           ("progress_current.md", "progress/current.md"),
+                           ("progress_history.md", "progress/history.md")):
+        run.write(harness / relative, render_template(source, name, values))
+    readme = target / "README.md"
+    if not readme.exists() or (in_place and is_scaffold_readme(readme, target)):
+        run.write(readme, render_template(source, "README.md", values))
+    for name in ("conventions.md", "testing.md"):
+        run.copy_file(source / HARNESS_DIR / "stacks" / stack_name / name, harness / "docs" / "stack" / name)
+
+
+def commit_config(source, target, stack_name, stack, values, run):
+    """Setting config.stack is what makes a project initialized, so it runs last."""
+    config = json.loads(render_template(source, "config.json", values))
+    config["stack"] = stack_name
+    config["commands"].update(stack.get("commands", {}))
+    config["no_tests"] = stack.get("no_tests", {})
+    config["generated_paths"] = stack.get("generated", [])
+    run.track(target / CONFIG)
+    write_json(target / CONFIG, config)
+
+
+def ensure_git(target, run):
+    inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(target),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if inside.returncode != 0:
+        run.track(target / ".git", kind="tree")
+        subprocess.run(["git", "init", "-q"], cwd=str(target), check=True)
+
+
+def install_project(args, stack, target, run):
+    name = slugify(args.name or target.name)
+    values = {"name": name, "project": name, "stack": args.stack}
+    in_place = (target / CONFIG).is_file()
+    source = target if in_place else SOURCE_ROOT
+    run.make_dirs(target)
+    if args.no_scaffold:
+        run.make_dirs(target / "src")
+        if not (target / "src" / ".gitkeep").exists():
+            run.write(target / "src" / ".gitkeep", "")
+    else:
+        build_app(args.stack, stack, target, values, run)
+    if not in_place:
+        copy_harness(source, target, args.stack, run)
+    merge_gitignore(source, target, args.stack, stack, run)
+    write_project_files(source, target, args.stack, values, in_place, run)
+    ensure_git(target, run)
+    run.write(target / OWNED_MANIFEST, json.dumps(owned_manifest(target, args.stack), indent=2) + "\n")
+    commit_config(source, target, args.stack, stack, values, run)
+    run.finish()
+    return name
+
+
+def run_install(args, stack, target):
+    """Install the project, or undo everything this run did and raise a clean error."""
+    run = InitRun(target)
+    with signals_raise():
+        try:
+            return install_project(args, stack, target, run)
+        except BaseException as exc:
+            for number in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(number, signal.SIG_IGN)
+            run.rollback()
+            if isinstance(exc, HarnessError) or not isinstance(exc, Exception):
+                raise
+            raise HarnessError(f"init failed and was rolled back: {exc}")
+
+
+def post_init_check(args, stack, target):
+    """Report the first check. The project stays initialized whatever it finds."""
+    configured = bool(stack.get("commands", {}).get("test"))
+    try:
+        code = report_check(target, with_tests=configured and not args.no_scaffold)
+    except (HarnessError, OSError, ValueError) as exc:
+        fail(str(exc))
+        code = 1
+    if not configured:
+        warn(f"set commands.test in {CONFIG}; `harness check` fails until you do")
+    if code != 0:
+        fail("initialized, but check failed: fix the problems above; do not run init again")
+        return EXIT_INIT_CHECK_FAILED
+    return 0
+
+
+def cmd_init(args):
+    stack = load_valid_stack(args.stack)
+    target = Path(args.path).expanduser().resolve()
+    recover_interrupted_init(target)
+    preflight(args.stack, stack, target)
+    name = run_install(args, stack, target)
+    ok(f"project {name} initialized with stack {args.stack} in {target}")
+    return post_init_check(args, stack, target)
+
+
+def cmd_stacks(args):
+    for path in sorted(stacks_dir().glob("*/stack.json")):
+        print(f"{path.parent.name:10} {load_json(path).get('description', '')}")
+    return 0
+
+
+def cmd_install(args):
+    bin_dir = Path(args.bin_dir).expanduser()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "harness"
+    if link.exists() and not link.is_symlink():
+        raise HarnessError(f"{link} exists and is not a symlink; refusing to replace it")
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(Path(__file__).resolve())
+    ok(f"installed {link}")
+    if str(bin_dir.resolve()) not in [str(Path(p).resolve()) for p in os.environ.get("PATH", "").split(os.pathsep) if p]:
+        warn(f"{bin_dir} is not on PATH")
+    return 0
+
+
+# --- update -----------------------------------------------------------------
+
+
+def file_hash(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def stack_runtime_files(root, stack):
+    """What a project needs from its stack: the manifest and its editable code rules."""
+    base = Path(root) / HARNESS_DIR / "stacks" / stack
+    paths = [base / "stack.json", base / "sgconfig.yml"] + sorted((base / "rules").glob("*.yml"))
+    return [path for path in paths if path.is_file()]
+
+
+def owned_files(root, stack):
+    """Harness-owned paths under root. Everything else belongs to the project."""
+    root = Path(root)
+    paths = [root / name for name in OWNED_FILES]
+    paths += stack_runtime_files(root, stack)
+    paths += [root / HARNESS_DIR / "templates" / name for name in RUNTIME_TEMPLATES]
+    for tree in OWNED_TREES:
+        paths += [p for p in (root / tree).rglob("*") if p.is_file() and not set(p.parts) & GENERATED_NAMES]
+    paths += [p for p in (root / ".harness/docs").glob("*.md") if p.name not in PROJECT_OWNED_DOCS]
+    return sorted(str(p.relative_to(root)) for p in paths if p.is_file())
+
+
+def owned_manifest(root, stack):
+    return {"version": HARNESS_VERSION, "files": {rel: file_hash(Path(root) / rel) for rel in owned_files(root, stack)}}
+
+
+def update_action(rel, target, incoming, recorded):
+    """same, add, replace or conflict: `recorded` is what the last install wrote."""
+    current = target / rel
+    if not current.is_file():
+        return "conflict" if rel in recorded else "add"
+    digest = file_hash(current)
+    if digest == incoming:
+        return "same"
+    return "replace" if recorded.get(rel) == digest else "conflict"
+
+
+def update_plan(target, stack, recorded):
+    plan = {}
+    for rel in owned_files(SOURCE_ROOT, stack):
+        action = update_action(rel, target, file_hash(SOURCE_ROOT / rel), recorded)
+        plan.setdefault(action, []).append(rel)
+    return plan
+
+
+def merged_settings(target):
+    """The project's settings with the harness hook entries refreshed and all else kept."""
+    settings = load_json(target / SETTINGS)
+    incoming = load_json(SOURCE_ROOT / SETTINGS)
+    if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
+        raise HarnessError(f"{SETTINGS} is not a settings object; fix it before updating")
+    merged = copy.deepcopy(settings)
+    hooks = merged.setdefault("hooks", {})
+    for event, groups in incoming["hooks"].items():
+        kept = []
+        for group in hooks.get(event, []):
+            entries = group.get("hooks", []) if isinstance(group, dict) else []
+            others = [hook for hook in entries if not is_any_harness_hook(hook)]
+            if others or not entries:
+                kept.append({**group, "hooks": others} if isinstance(group, dict) else group)
+        hooks[event] = kept + groups
+    return merged
+
+
+def is_any_harness_hook(hook):
+    return isinstance(hook, dict) and "harness" in str(hook.get("command", "")) and "hook" in (hook.get("args") or [])
+
+
+def dirty_owned_paths(target, paths):
+    try:
+        result = subprocess.run(["git", "-C", str(target), "status", "--porcelain", "--", *paths],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    except OSError:
+        return []
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def checkpoints_after_update(target, plan, force):
+    """The checkpoints text for the rules the project will end up with, if they have any."""
+    kept_local = ".harness/rules.json" in plan.get("conflict", []) and not force
+    rules = load_json((target if kept_local else SOURCE_ROOT) / RULES)
+    return render_checkpoints(rules) if "checkpoints" in rules else None
+
+
+def checkpoints_differ(target, text):
+    path = target / CHECKPOINTS
+    return text is not None and (not path.is_file() or read_text(path) != text)
+
+
+def print_update_plan(plan, settings_change):
+    for action, label in (("add", "add"), ("replace", "replace"), ("conflict", "locally modified")):
+        for rel in plan.get(action, []):
+            print(f"  {label}: {rel}")
+    if settings_change:
+        print(f"  merge hooks: {SETTINGS}")
+    if not any(plan.get(a) for a in ("add", "replace", "conflict")) and not settings_change:
+        print("  nothing to update")
+
+
+def apply_update(target, stack, plan, recorded, settings, checkpoints, force):
+    run = InitRun(target)
+    owned = set(owned_files(SOURCE_ROOT, stack))
+    files = {rel: digest for rel, digest in recorded.items() if rel in owned}
+    with signals_raise():
+        try:
+            for rel in plan.get("add", []) + plan.get("replace", []) + (plan.get("conflict", []) if force else []):
+                run.copy_file(SOURCE_ROOT / rel, target / rel)
+                files[rel] = file_hash(SOURCE_ROOT / rel)
+            if not force:
+                for rel in plan.get("conflict", []):
+                    run.copy_file(SOURCE_ROOT / rel, target / f"{rel}.new")
+                    warn(f"{rel} has local changes: kept it, incoming version is {rel}.new")
+            for rel in plan.get("same", []):
+                files[rel] = file_hash(SOURCE_ROOT / rel)
+            if settings is not None:
+                run.write(target / SETTINGS, json.dumps(settings, indent=2) + "\n")
+            if checkpoints_differ(target, checkpoints):
+                run.write(target / CHECKPOINTS, checkpoints)
+            manifest = {"version": HARNESS_VERSION, "files": files}
+            run.write(target / OWNED_MANIFEST, json.dumps(manifest, indent=2) + "\n")
+            run.finish()
+        except BaseException as exc:
+            for number in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(number, signal.SIG_IGN)
+            run.rollback()
+            if isinstance(exc, HarnessError) or not isinstance(exc, Exception):
+                raise
+            raise HarnessError(f"update failed and was rolled back: {exc}")
+
+
+def recover_interrupted_update(target):
+    if (target / MANIFEST).is_file():
+        entries = read_manifest(target)
+        warn(f"found an interrupted update: rolling back the {len(entries)} changes it listed")
+        undo_and_forget(target, entries)
+
+
+def cmd_update(args):
+    target = find_root()
+    config = load_config(target)
+    if config["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: there is nothing to update")
+    if target == SOURCE_ROOT or load_config(SOURCE_ROOT)["stack"] is not None:
+        raise HarnessError("run the global `harness` from a scaffold clone, not the project's own copy")
+    stack = config["stack"]
+    if not (SOURCE_ROOT / HARNESS_DIR / "stacks" / stack).is_dir():
+        raise HarnessError(f"the scaffold has no stack {stack}")
+    if not args.dry_run:
+        recover_interrupted_update(target)
+    path = target / OWNED_MANIFEST
+    recorded = load_json(path).get("files", {}) if path.is_file() else {}
+    plan = update_plan(target, stack, recorded)
+    merged = merged_settings(target)
+    settings = merged if merged != load_json(target / SETTINGS) else None
+    print_update_plan(plan, settings is not None)
+    checkpoints = checkpoints_after_update(target, plan, args.force)
+    if checkpoints_differ(target, checkpoints):
+        print(f"  regenerate: {CHECKPOINTS}")
+    if args.dry_run:
+        ok("dry run: nothing changed")
+        return 0
+    dirty = dirty_owned_paths(target, owned_files(target, stack) + [SETTINGS, CHECKPOINTS])
+    if dirty and not args.force:
+        raise HarnessError("harness-owned files have uncommitted changes; commit them or use --force:\n  "
+                           + "\n  ".join(dirty[:BRIEFING_LIST_CAP]))
+    apply_update(target, stack, plan, recorded, settings, checkpoints, args.force)
+    ok(f"updated to harness {HARNESS_VERSION}")
+    if ".harness/rules.json" in plan.get("conflict", []) and not args.force:
+        warn("your rules.json was kept: merge .harness/rules.json.new by hand, "
+             "then run `harness checkpoints --write`")
+    if report_check(target, with_tests=False) != 0:
+        fail("updated, but check failed: fix the problems above")
+        return EXIT_INIT_CHECK_FAILED
+    return 0
+
+
+# --- ci ---------------------------------------------------------------------
+
+
+def yaml_step(step):
+    """One workflow step. JSON strings are valid YAML, so values need no custom quoting."""
+    lines = []
+    for key in ("name", "uses", "run", "working-directory"):
+        if key in step:
+            lines.append(f"{'- ' if not lines else '  '}{key}: {json.dumps(step[key])}")
+    if step.get("with"):
+        lines.append("  with:")
+        lines += [f"    {key}: {json.dumps(value)}" for key, value in step["with"].items()]
+    return [f"      {line}" for line in lines]
+
+
+def render_workflow(steps):
+    common_start = [{"uses": "actions/checkout@v7"},
+                    {"uses": "actions/setup-python@v7", "with": {"python-version": "3.12"}}]
+    final = [{"name": "Harness check", "run": ".harness/bin/harness check"}]
+    lines = ["name: harness", "on:", "  push:", "  pull_request:", "jobs:", "  check:",
+             "    runs-on: ubuntu-latest", "    steps:"]
+    for step in common_start + steps + final:
+        lines += yaml_step(step)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_ci_github(args):
+    target = find_root()
+    config = load_config(target)
+    if config["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: run `harness init <stack>` first")
+    stack = load_json(target / HARNESS_DIR / "stacks" / config["stack"] / "stack.json")
+    workflow = target / WORKFLOW
+    if workflow.exists() and not args.force:
+        raise HarnessError(f"{WORKFLOW} already exists; use --force to replace it")
+    steps = stack.get("ci", {}).get("steps", [])
+    workflow.parent.mkdir(parents=True, exist_ok=True)
+    workflow.write_text(render_workflow(steps), encoding="utf-8")
+    ok(f"wrote {WORKFLOW}")
+    if "ci" not in stack:
+        warn(f"stack {config['stack']} declares no CI setup: add your toolchain steps before the "
+             f"harness check step in {WORKFLOW}")
+    return 0
+
+
+# --- sandbox ----------------------------------------------------------------
+
+
+def is_temporary(path):
+    """Temp folders stay writable under nono's default profile, so nothing there is protected."""
+    resolved = os.path.realpath(str(path))
+    roots = set(TEMP_ROOTS) | {os.path.realpath(tempfile.gettempdir())}
+    return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
+
+
+def toolchain_read_roots(tools):
+    """Install roots under $HOME, such as Anaconda or nvm, that nono's runtime groups do not cover."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    candidates = [sys.base_prefix, sys.prefix]
+    for tool in tools:
+        path = shutil.which(tool)
+        if path:
+            candidates.append(os.path.dirname(os.path.dirname(os.path.realpath(path))))
+    roots = {os.path.realpath(path) for path in candidates}
+    return sorted(root for root in roots if root.startswith(home + os.sep))
+
+
+def sandbox_profile(rules, read_roots=()):
+    """An allow-list: the project is read-only except the folders the workflow writes."""
+    policy = rules["sandbox"]
+    exposed = set(policy["writable"]) & set(SANDBOX_NEVER_WRITABLE)
+    if exposed:
+        raise HarnessError(f"rules.json: sandbox must not make these writable: {', '.join(sorted(exposed))}")
+    return {
+        "meta": {"name": "harness-sandbox", "description": "Project read-only except its working folders"},
+        "extends": "default",
+        "groups": {"include": policy["groups"]},
+        "workdir": {"access": "read"},
+        "filesystem": {
+            "allow": [f"$WORKDIR/{path}" for path in policy["writable"]] + policy["home_folders"],
+            "allow_file": policy["home_files"],
+            "read": policy["login_read"] + list(read_roots),
+            "bypass_protection": policy["login_read"],
+        },
+    }
+
+
+def sandbox_prefix(profile):
+    return ["nono", "run", "-s", "--allow-cwd", "--profile", str(profile), "--no-rollback", "--no-audit", "--"]
+
+
+def sandbox_command(profile, claude_args):
+    arguments = claude_args[1:] if claude_args[:1] == ["--"] else claude_args
+    return [*sandbox_prefix(profile), "claude", *arguments]
+
+
+def sandbox_preflight(root, profile):
+    """Prove the hook blocks inside the sandbox: a hook that cannot start fails open, silently."""
+    event = {"tool_name": "Write", "cwd": str(root),
+             "tool_input": {"file_path": str(root / RULES), "content": ""}}
+    command = [*sandbox_prefix(profile), str(root / HARNESS_DIR / "bin" / "harness"), "hook", "pre-tool-use"]
+    try:
+        result = subprocess.run(command, cwd=str(root), input=json.dumps(event), text=True,
+                                capture_output=True, timeout=SANDBOX_PREFLIGHT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HarnessError(f"could not test the hook inside the sandbox: {exc}") from exc
+    if result.returncode != EXIT_HOOK_BLOCK:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+        raise HarnessError(f"refusing to start: the hook does not work inside the sandbox, so no role rule "
+                           f"would be enforced ({detail[0]}). Check which python3 is first in your PATH")
+
+
+def stack_tools(root, config):
+    stack = load_json(root / HARNESS_DIR / "stacks" / config["stack"] / "stack.json")
+    return ["python3"] + [tool for alternatives in stack.get("requires", []) for tool in alternatives]
+
+
+def cmd_sandbox(args):
+    root = find_root()
+    config = load_config(root)
+    if config["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: run `harness init <stack>` first")
+    rules = load_rules(root)
+    if "sandbox" not in rules:
+        raise HarnessError("rules.json has no sandbox section: run `harness update` first")
+    if not shutil.which("nono"):
+        raise HarnessError("nono is not installed: run `brew install nono`")
+    if is_temporary(root):
+        raise HarnessError(f"{root} is in a temporary folder, which the sandbox cannot protect; move the project")
+    path = root / SANDBOX_PROFILE
+    write_json(path, sandbox_profile(rules, toolchain_read_roots(stack_tools(root, config))))
+    sandbox_preflight(root, path)
+    os.chdir(root)
+    os.execvp("nono", sandbox_command(path, args.claude_args))
+
+
+# --- Entry point ------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="harness", description="Claude Code project harness", allow_abbrev=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, handler, description):
+        sub = commands.add_parser(name, help=description, allow_abbrev=False)
+        sub.set_defaults(handler=handler)
+        return sub
+
+    init = command("init", cmd_init, "create a project from a stack")
+    init.add_argument("stack")
+    init.add_argument("path", nargs="?", default=".")
+    init.add_argument("--name")
+    init.add_argument("--no-scaffold", action="store_true", help="install the harness without generating the app")
+
+    command("stacks", cmd_stacks, "list available stacks")
+
+    check = command("check", cmd_check, "validate project state and run tests")
+    check.add_argument("--no-tests", action="store_true")
+
+    command("next", cmd_next, "print the one legal next action")
+
+    checkpoints = command("checkpoints", cmd_checkpoints, "print or write the checkpoints file")
+    checkpoints.add_argument("--write", action="store_true")
+
+    resume = command("resume", cmd_resume, "print a fast read-only briefing of the current work")
+    resume.add_argument("--json", action="store_true")
+
+    debt_actions = command("debt", None, "pay a debt in place").add_subparsers(dest="debt_action", required=True)
+    for action, handler, description in (("start", cmd_debt_start, "start paying a debt"),
+                                         ("resolve", cmd_debt_resolve, "close a paid debt on its evidence")):
+        sub = debt_actions.add_parser(action, help=description, allow_abbrev=False)
+        sub.add_argument("name")
+        sub.set_defaults(handler=handler)
+
+    task_actions = command("task", None, "record task progress").add_subparsers(dest="task_action", required=True)
+    start = task_actions.add_parser("start", help="record that a task has started", allow_abbrev=False)
+    start.add_argument("feature")
+    start.add_argument("task")
+    start.set_defaults(handler=cmd_task_start)
+
+    transition = command("transition", cmd_transition, "change a feature status")
+    transition.add_argument("feature")
+    transition.add_argument("state")
+    transition.add_argument("--as", dest="as_actor", default="leader", action=OnceOnly)
+    transition.add_argument("--reason", action=OnceOnly)
+
+    approve = command("approve", cmd_approve, "record human approval of a spec")
+    approve.add_argument("feature")
+
+    evidence = command("evidence", None, "manage the evidence of closed features")
+    evidence_actions = evidence.add_subparsers(dest="evidence_action", required=True)
+    restamp = evidence_actions.add_parser("restamp", help="human: accept changed reports of a closed feature",
+                                          allow_abbrev=False)
+    restamp.set_defaults(handler=cmd_evidence_restamp)
+    restamp.add_argument("feature")
+    restamp.add_argument("--reason", required=True)
+
+    sandbox = command("sandbox", cmd_sandbox, "run Claude Code under the project's nono sandbox")
+    sandbox.add_argument("claude_args", nargs=argparse.REMAINDER)
+
+    update = command("update", cmd_update, "update harness-owned files from the scaffold")
+    update.add_argument("--dry-run", action="store_true")
+    update.add_argument("--force", action="store_true")
+
+    ci_targets = command("ci", None, "generate a CI workflow").add_subparsers(dest="ci_target", required=True)
+    github = ci_targets.add_parser("github", help="write the GitHub Actions workflow", allow_abbrev=False)
+    github.add_argument("--force", action="store_true")
+    github.set_defaults(handler=cmd_ci_github)
+
+    hook = command("hook", cmd_hook, "Claude Code hook entry point")
+    hook.add_argument("event", choices=["pre-tool-use", "session-start"])
+
+    install = command("install", cmd_install, "put harness on PATH with a symlink")
+    install.add_argument("--bin-dir", default="~/.local/bin")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        return args.handler(args)
+    except (HarnessError, OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        print(f"harness: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("harness: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

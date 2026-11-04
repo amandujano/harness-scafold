@@ -1,0 +1,5 @@
+{
+  "project": "harness-scaffold",
+  "description": "Technical debt incurred by agents during coding sessions. Rules live in .harness/rules.json under debt.",
+  "debts": []
+}

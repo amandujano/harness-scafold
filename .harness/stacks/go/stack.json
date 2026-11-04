@@ -1,0 +1,66 @@
+{
+  "description": "Go module (standard testing package)",
+  "requires": [
+    [
+      "go"
+    ]
+  ],
+  "scaffold": [
+    {
+      "run": [
+        "go",
+        "mod",
+        "init",
+        "{{name}}"
+      ],
+      "cwd": "src"
+    }
+  ],
+  "commands": {
+    "test": "go test ./...",
+    "build": "go build ./...",
+    "lint": "go vet ./..."
+  },
+  "no_tests": {
+    "patterns": [
+      "\\[no test files\\]"
+    ],
+    "unless": [
+      "^ok\\s",
+      "^FAIL"
+    ],
+    "exit_codes": []
+  },
+  "gitignore": [
+    "src/bin/",
+    "src/coverage.out"
+  ],
+  "generated": [
+    "bin",
+    "coverage.out"
+  ],
+  "ci": {
+    "steps": [
+      {
+        "uses": "actions/setup-go@v7",
+        "with": {
+          "go-version-file": "src/go.mod"
+        }
+      }
+    ]
+  },
+  "test_names": {
+    "language": "Go",
+    "rule": {
+      "any": [
+        {
+          "pattern": "func $NAME($T *testing.T) { $$$B }"
+        },
+        {
+          "pattern": "$T.Run($NAME, $$$B)"
+        }
+      ]
+    },
+    "name_regex": "."
+  }
+}

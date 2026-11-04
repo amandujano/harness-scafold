@@ -1,0 +1,11 @@
+id: no-skipped-tests
+language: TypeScript
+severity: error
+message: "A skipped test proves nothing."
+rule:
+  any:
+    - pattern: "it.skip($$$A)"
+    - pattern: "test.skip($$$A)"
+    - pattern: "describe.skip($$$A)"
+    - pattern: "xit($$$A)"
+    - pattern: "xdescribe($$$A)"

@@ -1,56 +1,324 @@
-# AI Development Harness Scaffold
+<!-- harness-scaffold-readme -->
+# AI Development Harness
 
-This repository is a professional scaffold designed to coordinate the development of software using AI agents. It enforces a strict **Spec-Driven Development (SDD)** workflow to ensure that code is not written until requirements are clear, designed, and approved by a human.
+A scaffold for building software with Claude Code as a coordinated team of agents:
+**leader**, **spec_author**, **implementer** and **reviewer**. Code is not written
+until a human approves a spec, and work is not closed until tests prove it.
 
-## 🎯 Purpose
+Its key property: the rules are **executed, not just described**. The lifecycle and
+role permissions live in one file, and a CLI and a Claude Code hook enforce them
+outside the model.
 
-The goal of this harness is to eliminate "AI drift"—where the model iterates blindly without a stable target—by introducing formal specification and verification gates. It transforms the AI from a simple autocomplete tool into a structured team of specialized agents: **Leader**, **Spec Author**, **Implementer**, and **Reviewer**.
+This harness is for Claude Code only.
 
-## 📂 Repository Structure
+## Requirements
 
-| Path | Purpose |
-| :--- | :--- |
-| `src/` | The application source code. |
-| `tests/` | Automated test suite. |
-| `specs/` | SDD artifacts: Requirements, Design, and Task lists per feature. |
-| `docs/` | Project standards: Architecture, Conventions, and Verification rules. |
-| `progress/` | Session tracking: `current.md` (active work) and `history.md` (archive). |
-| `feature_list.json` | The source of truth for all features, their status, and SDD flags. |
-| `AGENTS.md` | The navigation map for AI agents entering the project. |
-| `init.sh` | Environment verification script (Must be green before any commit). |
-| `CHECKPOINTS.md` | High-level objective criteria for the project's final state. |
+- Python 3.9 or newer, used by the `harness` CLI (standard library only).
+- Git.
+- The toolchain of your stack. `harness init` checks it before changing anything.
 
-## 🔄 The SDD Workflow
+## Install
 
-This harness enforces the following state machine for every feature marked `"sdd": true` in `feature_list.json`:
+From a clone of this repository:
 
-`pending` $\rightarrow$ `[spec_author]` $\rightarrow$ `spec_ready` $\rightarrow$ **⏸ HUMAN APPROVAL** $\rightarrow$ `in_progress` $\rightarrow$ `[implementer]` $\rightarrow$ `[reviewer]` $\rightarrow$ `done`
+```bash
+.harness/bin/harness install     # symlinks harness into ~/.local/bin
+```
 
-### 1. Specification Phase
-The `spec_author` agent creates three files in `specs/<feature-name>/`:
-- **`requirements.md`**: What the feature does (using EARS notation).
-- **`design.md`**: How it's implemented (architecture, data flow, logic).
-- **`tasks.md`**: A granular, ordered checklist for the implementer.
+Use `--bin-dir DIR` for another location.
 
-### 2. Human Gate
-The workflow **stops** at `spec_ready`. A human must review the specs and provide a "Go" before the status is changed to `in_progress`.
+## Create a Project
 
-### 3. Implementation & Verification
-- The `implementer` executes the `tasks.md` checklist.
-- The `reviewer` validates the implementation against the requirements and verifies that all tests pass.
+```bash
+harness stacks                   # list available stacks
+harness init nest my-api         # or: go, java, python, generic
+cd my-api
+claude
+```
 
-## 🚀 Getting Started with this Scaffold
+`harness init <stack> [path] [--name NAME] [--no-scaffold]` generates the application
+in `src/` with the stack's own tools, installs the harness, configures the test,
+build and lint commands, merges `.gitignore`, runs `git init` when needed, and then
+validates the result. It never commits and never overwrites your README. It refuses
+a non-empty `src/` or an already initialized project. Setting `stack` in
+`.harness/config.json` is its last step: any failure, `SIGTERM` or `SIGHUP` before that
+undoes what the run created, so you can fix the cause and retry.
 
-To start a new project using this harness:
+| `init` exit code | Meaning |
+|---|---|
+| `0` | Initialized, and the check passed |
+| `1` | Not initialized; nothing was left behind |
+| `3` | Initialized, but the check failed. Fix the problems; do not run `init` again. `generic` returns this until `commands.test` is set |
 
-1. **Clone/Copy the scaffold** into your project root.
-2. **Configure `feature_list.json`**: Add your initial features and set `"sdd": true` for those requiring formal specs.
-3. **Define Standards**: Update `docs/architecture.md` and `docs/conventions.md` to reflect your project's specific quality bars.
-4. **Initialize**: Run `./init.sh` to verify your environment and test commands.
-5. **Direct the AI**: Point your AI agent to `AGENTS.md` to let it understand its role and the workflow it must follow.
+If `init` is killed outright, it leaves `.harness-init-manifest.json` in the target.
+Run `init` again: it rolls back exactly the paths listed there, says so, and continues.
 
-## 🛠 Maintenance
+| Stack | Generates | Needs |
+|---|---|---|
+| `nest` | `nest new` (npm, Jest) | `nest` or `npx`, `npm` |
+| `go` | `go mod init` and a small tested program | `go` |
+| `java` | Maven quickstart archetype | `mvn`, `java`; network on first use |
+| `python` | `pyproject.toml`, package and `unittest` test | `python3` |
+| `generic` | Nothing | Set `commands.test` in `.harness/config.json` |
 
-- **Environment Check**: Always run `./init.sh` before declaring a task `done`.
-- **Progress Tracking**: Keep `progress/current.md` updated in real-time.
-- **Cleanup**: Move summaries from `current.md` to `history.md` at the end of every session.
+You can also run `.harness/bin/harness init <stack>` inside a fresh clone to turn
+that clone into the project. Its `.harness/tests/` and other stacks remain until you
+delete them.
+
+## Project Layout
+
+```
+.claude/     Claude Code configuration: instructions, agents, skills, hook wiring
+.harness/    The process: rules, state, specs, reports, docs. Not application code
+src/         The whole application: manifest, code and tests
+```
+
+`.harness/manifest.json` records the harness files as installed, so `harness update`
+can tell them from your edits. `.github/workflows/harness.yml` exists only after you
+run `harness ci github`.
+
+`.claude/` stays outside `.harness/` because Claude Code loads agents and settings
+from fixed locations. A generated `.harness/` is slim: from `stacks/` it keeps its `stack.json` and
+code rules, the guides live in `.harness/docs/stack/`, and from `templates/` it keeps only
+the session template. Stack commands run from `src/`, so frameworks keep their usual
+layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Maven.
+
+## Daily Flow
+
+1. Describe what you want in Claude Code. The leader writes features to
+   `.harness/state/feature_list.json`.
+2. The leader follows `harness next`, which prints the one legal next action.
+3. `spec_author` writes `.harness/specs/<feature>/`, and the flow stops.
+4. Read the spec, then approve it **from your own terminal**:
+
+   ```bash
+   harness approve <feature>
+   ```
+
+5. `implementer` builds, `reviewer` approves or requests changes, and the leader
+   closes the feature with `harness transition <feature> done`.
+
+| Command | Purpose |
+|---|---|
+| `harness check [--no-tests]` | Validate state and invariants, and run tests |
+| `harness next` | Print the one legal next action |
+| `harness resume [--json]` | Print a fast, read-only briefing; never runs tests |
+| `harness task start <feature> T<n>` | Implementer: record that a task has started |
+| `harness debt start <name>` | Leader: start paying an `sdd: false` debt in place |
+| `harness debt resolve <name>` | Leader: close a paid debt on its evidence |
+| `harness checkpoints [--write]` | Print `.harness/CHECKPOINTS.md`, or regenerate it (human only) |
+| `harness sandbox [-- <claude args>]` | Run Claude Code under the project's nono sandbox |
+| `harness update [--dry-run] [--force]` | Update harness-owned files from the scaffold |
+| `harness ci github [--force]` | Write the GitHub Actions workflow |
+| `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
+| `harness evidence restamp <feature> --reason <text>` | Human: accept changed reports of a closed feature, keeping an audit entry |
+| `harness approve <feature>` | Human approval: type the code shown on your terminal. Later spec edits invalidate it |
+
+To resume a blocked feature, run this in your own terminal:
+
+```bash
+harness transition <feature> <previous-state> --as human
+```
+
+## Recovering From an Interruption
+
+**What survives:** everything on disk: status, specs, reports, the log, and which task
+was started and not ticked. `harness task start` records that outside agent discipline.
+
+**How to resume:** start a new session. A `SessionStart` hook injects the `harness resume`
+briefing, and `harness next` prints `implementer: resume <feature> at T3 (started, not
+finished)`. The leader asks you whether to resume or to block.
+
+**Limits:**
+
+- Uncommitted code in `src/` is not a restore point. It is whatever the interrupted task
+  left, possibly half-written.
+- Committing per task is your decision; the harness does not automate it.
+- The briefing skips tests and slow guards, so it says when `harness next` may differ.
+- Tasks exist only for `sdd: true` features, so other work has no in-flight trace.
+
+## Skills
+
+Skills ship in `.claude/skills/`, and `harness update` delivers changes to them. The
+assignment lives in `skills` in `.harness/rules.json`, and `harness check` fails if an
+assigned skill is missing or an agent's frontmatter disagrees. Preloaded skills inject
+their full text into every agent run, so the list stays short; the rest load on demand.
+
+| Agent | Preloaded | On demand |
+|---|---|---|
+| `leader` | `feature-decomposition` | `system-design`, `clean-architecture` |
+| `spec_author` | `ears-specs` | `system-design`, `clean-architecture` |
+| `implementer` | `unit-testing`, `clean-code-principles` | `clean-architecture`, `ast-grep` |
+| `reviewer` | `qa`, `clean-code-principles` | `clean-architecture`, `ast-grep` |
+
+Skills advise. `.harness/docs/architecture.md` and the spec win.
+
+`clean-architecture` (wondelai/skills) and `clean-code-principles`
+(asyrafhussin/agent-skills) are vendored under MIT; each folder keeps its `LICENSE` and a
+`NOTICE.md`.
+
+`find-skills` and `npx skills find` are for you, to discover skills. The hook blocks
+agents from `npx skills add` and `npx skills update`: an unattended install is a supply
+chain risk. `sdd-*` and `spec-kitty` are not shipped because they bring a competing
+workflow, and the hook keeps them read-only here anyway.
+
+## Code Rules (Optional)
+
+With [ast-grep](https://ast-grep.github.io/) installed (`brew install ast-grep`),
+`harness check` runs each stack's rules from `src/`, and a finding fails the check. The
+rules are few and aimed at leftovers: debug output, and focused or skipped tests. It also
+confirms that each `R<n>` maps to a name that really is a test.
+
+Without it, `check` warns and continues, and test names are matched as plain text.
+
+Rules live in `.harness/stacks/<stack>/` and are yours to tune. `harness update` treats a
+local edit like any other: it keeps yours and writes `<file>.new`. The `generic` stack
+ships none.
+
+## Sandbox (Optional)
+
+`harness sandbox` runs Claude Code under [nono](https://nono.sh), which enforces the limit
+the hook cannot: a plain script is stopped at OS level.
+
+```bash
+brew install nono
+harness sandbox                  # or: harness sandbox -- -p "your prompt"
+```
+
+Demonstrated on macOS with nono 0.81.0, including from a Python script that the hook
+allowed:
+
+| Result | Paths |
+|---|---|
+| Writes fail | `.harness/approvals/`, `.harness/rules.json`, `.harness/bin/`, `.harness/config.json`, `.claude/`, root files such as `README.md` |
+| Writes work | `src/`, `.harness/state/`, `.harness/specs/`, `.harness/progress/`, `.harness/docs/` |
+
+What to know before relying on it:
+
+- It applies to the whole session, not per role. The hook still separates roles.
+- `.harness/state/` stays writable because `harness transition` needs it, so state is
+  still only guarded by the hook and by `harness check`.
+- Toolchains installed under your home, such as Anaconda or nvm, get read-only access. Before
+  starting, `harness sandbox` proves the hook blocks inside it, and refuses to start if not.
+- `harness approve` must run from your own terminal, outside the sandbox.
+- `.git/` is read-only inside it, so commit from outside.
+- `~/.claude` stays writable because Claude Code needs it, so a sandboxed agent could change
+  your user-level settings. Review them if a session behaves unexpectedly.
+- It refuses a project in a temporary folder: those stay writable and nothing there would
+  be protected.
+- Claude Code's login needs read access to `~/Library/Keychains`, which relaxes one nono
+  default. Credential files such as `~/.ssh` stay blocked.
+- The profile is macOS-tested only, and interactive sessions were not exercised.
+
+## Update a Project
+
+Run the global `harness` from inside a project; it uses its own scaffold clone as the
+source. Commit first: it refuses to start over uncommitted harness files.
+
+```bash
+harness update --dry-run         # print the plan and change nothing
+harness update                   # add `--force` to overwrite local changes
+```
+
+`.harness/manifest.json` records what the last install wrote. An unchanged file is
+replaced. A locally modified file is kept, and the incoming version lands beside it as
+`<file>.new`. Without a manifest, every differing file counts as locally modified. Hook
+entries in `.claude/settings.json` are merged, and your other settings stay. A failure
+rolls everything back.
+
+It updates the CLI, `rules.json`, the session template, the project's `stack.json` and
+code rules, generic docs, agents and skills, and regenerates `.harness/CHECKPOINTS.md` from the
+resulting rules. If it keeps your `rules.json`, merge `rules.json.new` by hand and run
+`harness checkpoints --write`. Files an older project has beyond this are left alone.
+It never touches `.harness/state/`, `specs/`, `progress/`, `approvals/`,
+`config.json`, `src/`, `.claude/CLAUDE.md`, `.harness/docs/stack/`, `architecture.md` or
+`conventions.md`. Only you run it: the hook blocks agents.
+
+## Continuous Integration
+
+```bash
+harness ci github                # writes .github/workflows/harness.yml
+```
+
+The workflow runs on push and pull request, sets up the stack's toolchain, and runs
+`harness check`. Each stack declares its setup under `ci` in `stack.json`. `generic`
+declares none, so it tells you what to add. An existing workflow needs `--force`.
+
+CI matters because the hook only governs Claude Code. CI is what audits approvals and
+catches changes made outside it. Review changes to `.harness/approvals/` in pull
+requests. Agents may not write `.github/workflows/`.
+
+## How Rules Are Enforced
+
+`.harness/rules.json` is the single source of truth for states, transitions, role
+permissions and invariants. If prose disagrees with it, it wins.
+
+`.claude/settings.json` runs `harness hook pre-tool-use` before Write, Edit,
+MultiEdit, NotebookEdit and Bash, and `harness hook session-start` when a session
+opens. The main conversation counts as `leader`. Paths are
+compared case-insensitively. Agent types outside the four roles may write only what
+`unknown_role_allow` lists, which excludes `src/`, `.harness/` and `.claude/`.
+
+Evidence has one owner: only `reviewer` writes `.harness/progress/review_*`, and only
+`implementer` writes `.harness/progress/impl_*`. A feature's `sdd` is immutable for
+agents, and so is its `name` once a spec, approval or report exists; a human edits them
+directly. Feature files are validated on write, so an invalid name is refused at once.
+
+The debt ledger keeps every entry: no agent may remove one or mark it `resolved` by
+hand. Only a human may lower, accept or drop a `critical` debt.
+
+`harness approve`, `harness update` and `harness ci github` are for humans, and the
+hook blocks agents from running them. Agents also cannot write `.github/workflows/`.
+
+Global agents, such as `sdd-*`, are outside the four roles, so they are **read-only**
+inside generated projects. Use the project's own agents there.
+
+Paths in a stack's `generated` list, such as `dist` or `node_modules`, are writable by
+the implementer through Bash, including at the project root. They can never match
+`.harness`, `.claude` or `.git`.
+
+Limits you should know:
+
+- Bash inspection is a **guardrail, not a sandbox**. It catches common write patterns,
+  not every possible command. Script bodies run by an interpreter are not inspected.
+  Git operations that swap whole trees, such as switching branches and `git stash`, stay
+  allowed even though they rewrite files. So do build tools and `xargs` with piped paths.
+- **Outside the sandbox, the human gate cannot fully stop a process running as your
+  user.** `harness approve` reads a random code from `/dev/tty`, ignores stdin, and records
+  who and when in `.harness/approvals/`. That guards against accidental and routine agent
+  behaviour, not a determined adversary. Use `harness sandbox`, and audit approvals in
+  code review or CI.
+- A hook that cannot start, such as with no `python3`, does not block anything: Claude
+  Code only blocks on exit code 2. Rules that cannot be loaded do block.
+- The hook governs Claude Code only. Your editor and terminal are not restricted.
+- `harness check` confirms each requirement maps to a name that occurs in `src/`.
+  Judging that the test is meaningful stays with the reviewer.
+- The generated workflow has run on GitHub for the python stack only, and it does not
+  install ast-grep, so code rules are skipped there. Recovery from an update killed midway
+  is untested: use `harness update --dry-run` first on an important project.
+
+## Add a Stack
+
+Create `.harness/stacks/<name>/` with these files. No CLI change is needed.
+
+| File | Content |
+|---|---|
+| `stack.json` | `description`, `requires`, `scaffold`, `commands`, `no_tests`, `generated`, `gitignore`, `ci` |
+| `conventions.md` | Language and framework rules for agents |
+| `testing.md` | Test location, naming and how to run one test |
+| `scaffold/` | Optional files copied into `src/`; `{{name}}` is replaced |
+
+Use `.harness/stacks/go/stack.json` as a reference. In `no_tests`, list under
+`exit_codes` any non-zero code your test tool really uses for "no tests", such as
+`5` for `unittest` and `1` for Jest. A non-zero exit without a declared code is a
+failure. Under `unless`, list output proving tests did run, so a multi-module build
+with one empty module is not reported as having no tests.
+
+## Developing the Harness
+
+This repository has `"stack": null` in `.harness/config.json`, so it is the scaffold
+itself and enforcement is off. Run its test suite with:
+
+```bash
+python3 -m unittest discover -s .harness/tests
+```

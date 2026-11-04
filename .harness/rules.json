@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "states": ["pending", "spec_ready", "in_progress", "done", "blocked"],
+  "initial_state": "pending",
+  "agents": ["leader", "spec_author", "implementer", "reviewer"],
+  "transitions": [
+    {
+      "from": ["pending"],
+      "to": "spec_ready",
+      "actor": "spec_author",
+      "when": { "sdd": true },
+      "guards": ["spec_files_exist", "spec_shape"]
+    },
+    {
+      "from": ["spec_ready"],
+      "to": "in_progress",
+      "actor": "leader",
+      "when": { "sdd": true },
+      "guards": ["spec_files_exist", "spec_shape", "valid_approval", "no_other_in_progress"]
+    },
+    {
+      "from": ["pending"],
+      "to": "in_progress",
+      "actor": "leader",
+      "when": { "sdd": false },
+      "guards": ["no_other_in_progress"]
+    },
+    {
+      "from": ["in_progress"],
+      "to": "done",
+      "actor": "leader",
+      "guards": ["review_approved", "tasks_complete", "traceability", "check_green"]
+    },
+    {
+      "from": ["pending", "spec_ready", "in_progress"],
+      "to": "blocked",
+      "actor": "any_agent",
+      "guards": ["reason_given"]
+    },
+    {
+      "from": ["blocked"],
+      "to": "@previous",
+      "actor": "human",
+      "guards": ["no_other_in_progress_on_resume"]
+    }
+  ],
+  "roles": {
+    "leader": {
+      "allow": [
+        ".harness/state/feature_list.json",
+        ".harness/state/techdebt_list.json",
+        ".harness/progress/**",
+        ".harness/docs/**",
+        "*.md"
+      ],
+      "deny": [".harness/progress/impl_*", ".harness/progress/review_*"]
+    },
+    "spec_author": {
+      "allow": [
+        ".harness/specs/**",
+        ".harness/progress/spec_*",
+        ".harness/state/techdebt_list.json"
+      ]
+    },
+    "implementer": {
+      "allow": [
+        "src/**",
+        ".harness/specs/{active}/tasks.md",
+        ".harness/progress/**",
+        ".harness/state/techdebt_list.json"
+      ],
+      "deny": [".harness/progress/review_*"],
+      "generated_paths": true
+    },
+    "reviewer": {
+      "allow": [".harness/progress/review_*"]
+    }
+  },
+  "protected": ["src/**", ".harness/**", ".claude/**", ".git/**", ".github/workflows/**"],
+  "unknown_role_allow": ["*.txt", "tmp/**"],
+  "debt": {
+    "statuses": ["open", "accepted", "scheduled", "in_progress", "resolved", "wontfix"],
+    "severities": ["low", "medium", "high", "critical"],
+    "kinds": [
+      "shortcut",
+      "missing_test",
+      "spec_deviation",
+      "architecture_violation",
+      "duplication",
+      "unverified_assumption",
+      "tooling",
+      "documentation"
+    ],
+    "append_only_roles": ["spec_author", "implementer"],
+    "transitions": [
+      {
+        "from": ["open", "accepted"],
+        "to": "in_progress",
+        "actor": "leader",
+        "guards": ["debt_paid_in_place", "no_other_in_progress"]
+      },
+      {
+        "from": ["in_progress"],
+        "to": "resolved",
+        "actor": "leader",
+        "guards": ["review_approved", "acceptance_covered", "debt_check_green"]
+      }
+    ]
+  },
+  "command_roles": {
+    "debt": ["leader"],
+    "task": ["implementer"],
+    "update": [],
+    "evidence": [],
+    "sandbox": [],
+    "ci": []
+  },
+  "skills": {
+    "leader": { "preload": ["feature-decomposition"], "on_demand": ["system-design", "clean-architecture"] },
+    "spec_author": { "preload": ["ears-specs"], "on_demand": ["system-design", "clean-architecture"] },
+    "implementer": { "preload": ["unit-testing", "clean-code-principles"], "on_demand": ["clean-architecture", "ast-grep"] },
+    "reviewer": { "preload": ["qa", "clean-code-principles"], "on_demand": ["clean-architecture", "ast-grep"] }
+  },
+  "sandbox": {
+    "writable": ["src", ".harness/state", ".harness/specs", ".harness/progress", ".harness/docs"],
+    "home_folders": ["$HOME/.claude"],
+    "home_files": ["$HOME/.claude.json"],
+    "login_read": ["$HOME/Library/Keychains"],
+    "groups": ["claude_code_macos", "python_runtime", "node_runtime", "go_runtime", "go_runtime_macos", "java_runtime", "git_config", "user_caches_macos"]
+  },
+  "required_files": [
+    ".claude/CLAUDE.md",
+    ".claude/settings.json",
+    ".claude/agents/leader.md",
+    ".claude/agents/spec_author.md",
+    ".claude/agents/implementer.md",
+    ".claude/agents/reviewer.md",
+    ".harness/AGENTS.md",
+    ".harness/CHECKPOINTS.md",
+    ".harness/state/feature_list.json",
+    ".harness/state/techdebt_list.json",
+    ".harness/progress/current.md",
+    ".harness/progress/history.md",
+    ".harness/docs/architecture.md",
+    ".harness/docs/conventions.md",
+    ".harness/docs/specs.md",
+    ".harness/docs/verification.md",
+    ".harness/docs/stack/conventions.md",
+    ".harness/docs/stack/testing.md"
+  ],
+  "invariants": [
+    { "id": "hook_wired", "checkpoint": "C1", "description": "`.claude/settings.json` runs the harness PreToolUse and SessionStart hooks." },
+    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature or debt is `in_progress`." },
+    { "id": "spec_files_present", "checkpoint": "C6", "description": "Every `sdd: true` feature past `pending` has its 3 spec files." },
+    { "id": "spec_shape_valid", "checkpoint": "C6", "description": "Every `sdd: true` feature past `pending` has `R<n>` headings and tasks that reference them." },
+    { "id": "approval_valid", "checkpoint": "C6", "description": "Every `sdd: true` feature in `in_progress` or `done` has an approval that matches its current spec." },
+    { "id": "done_tasks_complete", "checkpoint": "C6", "description": "Every `done` `sdd: true` feature has all tasks `[x]`." },
+    { "id": "done_traceability", "checkpoint": "C6", "description": "Every `R<n>` of a `done` feature maps to a test name that occurs in `src/`." },
+    { "id": "done_review_approved", "checkpoint": "C2", "description": "Every `done` feature has an implementation report and a current APPROVED review." },
+    { "id": "no_open_critical_debt", "checkpoint": "C7", "description": "No `critical` debt is `open`." },
+    { "id": "resolved_debt_has_evidence", "checkpoint": "C7", "description": "Every `resolved` debt has current evidence or the feature that paid it." },
+    { "id": "task_record_valid", "checkpoint": "C2", "description": "The task record, when present, is well formed." },
+    { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every `scheduled` debt with `sdd: true` has a feature with the same `name` that is not `done`." },
+    { "id": "checkpoints_current", "checkpoint": "C1", "description": "`.harness/CHECKPOINTS.md` matches `.harness/rules.json`." },
+    { "id": "skills_assigned", "checkpoint": "C1", "description": "Every skill assigned in `.harness/rules.json` exists, and agent frontmatter matches the assignment." }
+  ],
+  "checkpoints": {
+    "title": "CHECKPOINTS — Final State Evaluation",
+    "intro": [
+      "In multi-agent systems, the path is not evaluated; the destination is.",
+      "",
+      "**[auto]** items are enforced by `.harness/bin/harness check`: a passing check",
+      "proves them, so do not re-judge them. The remaining items need judgment."
+    ],
+    "sections": [
+      {
+        "id": "C1",
+        "title": "The Harness is Complete",
+        "auto": [
+          "Every file in `required_files` of `.harness/rules.json` exists.",
+          "`.harness/bin/harness check` exits 0."
+        ]
+      },
+      {
+        "id": "C2",
+        "title": "State is Consistent",
+        "auto": [
+          "State files are valid and use only known statuses."
+        ],
+        "judgment": [
+          "`.harness/progress/current.md` is empty or describes the active session."
+        ]
+      },
+      {
+        "id": "C3",
+        "title": "Code Respects Architecture",
+        "judgment": [
+          "`src/` only contains what `.harness/docs/architecture.md` and the specs plan.",
+          "New dependencies are justified in the feature's spec.",
+          "No debug output or contextless TODOs."
+        ]
+      },
+      {
+        "id": "C4",
+        "title": "Verification is Real",
+        "auto": [
+          "`commands.test` is configured and passes.",
+          "When a feature is `done`, the test command finds tests."
+        ],
+        "judgment": [
+          "Tests follow `.harness/docs/stack/testing.md` and assert concrete results."
+        ]
+      },
+      {
+        "id": "C5",
+        "title": "Session Closed Correctly",
+        "judgment": [
+          "No suspicious untracked files.",
+          "`.harness/progress/history.md` has an entry for the last session."
+        ]
+      },
+      {
+        "id": "C6",
+        "title": "Spec Driven Development",
+        "judgment": [
+          "Each mapped test really verifies its `R<n>`.",
+          "`requirements.md` uses strict EARS (see `.harness/docs/specs.md`)."
+        ]
+      },
+      {
+        "id": "C7",
+        "title": "Technical Debt is Declared, Not Hidden",
+        "auto": [
+          "Every debt has verifiable fields: non-empty `acceptance`, and an `origin` naming agent, feature and session."
+        ],
+        "judgment": [
+          "Every `acceptance` item is genuinely verifiable.",
+          "Every shortcut visible in the session's diff has a matching entry. A clean ledger next to a diff full of compromises is a **failing** checkpoint."
+        ]
+      }
+    ],
+    "notes": [
+      "**How to use this file:** the reviewer goes through the items that need judgment and rejects the work if any fails.",
+      "> **On C7:** an empty debt ledger is only credible when the diff is genuinely clean. A reviewer that never finds debt is either reviewing perfect work or not reviewing at all."
+    ]
+  }
+}

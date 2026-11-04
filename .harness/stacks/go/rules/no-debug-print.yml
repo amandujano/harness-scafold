@@ -1,0 +1,9 @@
+id: no-debug-print
+language: Go
+severity: error
+message: "The println builtin and spew.Dump are debug output."
+rule:
+  any:
+    - pattern: "println($$$A)"
+    - pattern: "print($$$A)"
+    - pattern: "spew.Dump($$$A)"

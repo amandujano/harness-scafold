@@ -1,0 +1,10 @@
+{
+  "project": "harness-scaffold",
+  "stack": null,
+  "app_dir": "src",
+  "commands": {
+    "test": "",
+    "build": "",
+    "lint": ""
+  }
+}

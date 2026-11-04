@@ -1,0 +1,9 @@
+id: no-skipped-tests
+language: Python
+severity: error
+message: "A skipped test proves nothing."
+rule:
+  any:
+    - pattern: "@unittest.skip($$$A)"
+    - pattern: "@pytest.mark.skip($$$A)"
+    - pattern: "@pytest.mark.skip"

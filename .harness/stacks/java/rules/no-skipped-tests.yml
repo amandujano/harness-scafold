@@ -1,0 +1,10 @@
+id: no-skipped-tests
+language: Java
+severity: error
+message: "A disabled test proves nothing."
+rule:
+  any:
+    - kind: marker_annotation
+      regex: '^@([\w.]+\.)?(Disabled|Ignore)$'
+    - kind: annotation
+      regex: '^@([\w.]+\.)?(Disabled|Ignore)\b'

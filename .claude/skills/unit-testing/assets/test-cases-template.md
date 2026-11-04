@@ -3,17 +3,17 @@
 Status: DRAFT (written before implementation) | IN PROGRESS | COMPLETE
 
 Plain-text catalog of every unit test for this module. No code. Each entry is a
-single `it(...)` title. Check `[x]` when the spec exists and passes.
+single test title. Check `[x]` when the spec exists and passes.
 
 Conventions:
-- One `##` section per unit (service / controller / guard / decorator / dto).
+- One `##` section per unit under test.
 - Entry format: `[ ] <what it does> — GIVEN <state> WHEN <action> THEN <result>`
 - Group entries: happy path, error paths, edge cases.
-- Spec `it(...)` text must match the entry text verbatim.
+- Test titles must match the entry text verbatim.
 
 ---
 
-## <UnitName> (`src/<path>/<file>.ts`)
+## <UnitName> (`src/<path>/<file>`)
 
 ### Happy path
 - [ ] ...
