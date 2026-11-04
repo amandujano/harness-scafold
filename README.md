@@ -96,6 +96,10 @@ layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Ma
 |---|---|
 | `harness check [--no-tests]` | Validate state and invariants, and run tests |
 | `harness next` | Print the one legal next action |
+| `harness resume [--json]` | Print a fast, read-only briefing; never runs tests |
+| `harness task start <feature> T<n>` | Implementer: record that a task has started |
+| `harness debt start <name>` | Leader: start paying an `sdd: false` debt in place |
+| `harness debt resolve <name>` | Leader: close a paid debt on its evidence |
 | `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
 | `harness approve <feature>` | Human approval: type the code shown on your terminal. Later spec edits invalidate it |
 
@@ -104,6 +108,23 @@ To resume a blocked feature, run this in your own terminal:
 ```bash
 harness transition <feature> <previous-state> --as human
 ```
+
+## Recovering From an Interruption
+
+**What survives:** everything on disk: status, specs, reports, the log, and which task
+was started and not ticked. `harness task start` records that outside agent discipline.
+
+**How to resume:** start a new session. A `SessionStart` hook injects the `harness resume`
+briefing, and `harness next` prints `implementer: resume <feature> at T3 (started, not
+finished)`. The leader asks you whether to resume or to block.
+
+**Limits:**
+
+- Uncommitted code in `src/` is not a restore point. It is whatever the interrupted task
+  left, possibly half-written.
+- Committing per task is your decision; the harness does not automate it.
+- The briefing skips tests and slow guards, so it says when `harness next` may differ.
+- Tasks exist only for `sdd: true` features, so other work has no in-flight trace.
 
 ## How Rules Are Enforced
 

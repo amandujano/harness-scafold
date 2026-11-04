@@ -59,8 +59,14 @@ On every session:
      `.harness/state/feature_list.json` as a `pending` feature with the same `name`
      and leave it `scheduled` here. `harness transition <name> done` resolves it.
    - `wontfix` — no longer relevant. Say why in `description`.
+
+   To pay an `open` or `accepted` debt with `sdd: false` in place, run
+   `harness debt start <name>` when nothing else is active. `harness next` then
+   routes the implementer and the reviewer, and `harness debt resolve <name>` closes
+   it. To abandon the payment, set the debt back to `accepted` by hand.
 3. **Escalate.** `severity: "critical"` blocks session closure. Surface it to the
-   human; do not quietly downgrade it.
+   human. Only a human may lower its severity, accept it or drop it, and no agent
+   may remove a debt entry: the hook blocks these edits.
 4. **Report** the debt delta (opened / resolved / promoted) to the human at the
    end of every session.
 
@@ -87,7 +93,9 @@ which enforces `.harness/rules.json`. Never edit `status` by hand; the hook bloc
   and, when `sdd: true`, the `.harness/specs/<name>/` path.
 - **`reviewer:` action** — launch **1 `reviewer`**. On `CHANGES_REQUESTED` the
   feature stays `in_progress` and `harness next` loops back to the implementer.
-- **Interrupted `in_progress`** — ask the human whether to resume or to block it.
+- **`implementer: resume <feature> at T<n>`** — `harness next` has detected an
+  interrupted task, so you do not need to look for one. Ask the human whether to
+  resume or to block it, then launch the implementer or block the feature.
 
 ## Orchestrating subagents
 
@@ -117,8 +125,8 @@ which enforces `.harness/rules.json`. Never edit `status` by hand; the hook bloc
   `.harness/progress/review_*`.
 - ❌ Change a feature `status` by hand. `done` happens only through
   `harness transition <name> done`, after the reviewer has APPROVED.
-- ❌ Mark a debt as `resolved` by hand; the hook blocks it. A debt resolves only
-  when its promoted feature closes through `harness transition <name> done`.
+- ❌ Mark a debt as `resolved` by hand; the hook blocks it. Only evidence resolves
+  debt, through `harness debt resolve <name>` or its promoted feature closing.
 - ❌ Close a session with a `critical` debt left `open`.
 - ❌ Accept subagent results that come in chat without a reference to
   a file.

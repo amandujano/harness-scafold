@@ -91,7 +91,25 @@
       "tooling",
       "documentation"
     ],
-    "append_only_roles": ["spec_author", "implementer"]
+    "append_only_roles": ["spec_author", "implementer"],
+    "transitions": [
+      {
+        "from": ["open", "accepted"],
+        "to": "in_progress",
+        "actor": "leader",
+        "guards": ["debt_paid_in_place", "no_other_in_progress"]
+      },
+      {
+        "from": ["in_progress"],
+        "to": "resolved",
+        "actor": "leader",
+        "guards": ["review_approved", "acceptance_covered", "debt_check_green"]
+      }
+    ]
+  },
+  "command_roles": {
+    "debt": ["leader"],
+    "task": ["implementer"]
   },
   "required_files": [
     ".claude/CLAUDE.md",
@@ -115,7 +133,7 @@
   ],
   "invariants": [
     { "id": "hook_wired", "checkpoint": "C1", "description": ".claude/settings.json runs the harness PreToolUse hook" },
-    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature is in_progress" },
+    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature or debt is in_progress" },
     { "id": "spec_files_present", "checkpoint": "C6", "description": "Every sdd feature past pending has its three spec files" },
     { "id": "spec_shape_valid", "checkpoint": "C6", "description": "Every sdd feature past pending has R<n> headings and tasks that reference them" },
     { "id": "approval_valid", "checkpoint": "C6", "description": "Every sdd feature in in_progress or done has an approval matching its current spec" },
@@ -123,6 +141,8 @@
     { "id": "done_traceability", "checkpoint": "C6", "description": "Every R<n> of a done sdd feature maps to a test name that occurs in the application" },
     { "id": "done_review_approved", "checkpoint": "C2", "description": "Every done feature has an implementation report and a current APPROVED review" },
     { "id": "no_open_critical_debt", "checkpoint": "C7", "description": "No critical debt is open" },
+    { "id": "resolved_debt_has_evidence", "checkpoint": "C7", "description": "Every resolved debt has current evidence or the feature that paid it" },
+    { "id": "task_record_valid", "checkpoint": "C2", "description": "The task record, when present, is well formed" },
     { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every scheduled sdd debt has a matching feature that is not done" }
   ]
 }

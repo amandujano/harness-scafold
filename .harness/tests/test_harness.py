@@ -1071,10 +1071,11 @@ class ScenarioCase(ProjectCase):
                     digest.append((str(path), path.read_bytes()))
         return hash(tuple(digest))
 
-    def play(self, verdicts=(), block_at=None, limit=40):
+    def play(self, verdicts=(), block_at=None, limit=40, crash_at=None):
         """Run until no work is left. Fails on any repeat without a state change."""
         self.verdicts = list(verdicts)
         self.attempts = 0
+        self.crash_at = crash_at
         seen, trail = set(), []
         while True:
             if block_at and self.status() == block_at:
@@ -1094,7 +1095,8 @@ class ScenarioCase(ProjectCase):
     def perform(self, action):
         actor = action.split(":", 1)[0]
         command = re.search(r"`(harness [^`]+)`", action)
-        name = re.search(r"feature (\S+?)[,:]?(?:\s|$)", action)
+        name = re.search(r"(?:feature|debt|resume|closing) (\S+?)[,:]?(?:\s|$)", action)
+        is_debt = " debt " in action or "review_debt-" in action
         if actor == "leader":
             self.assertIsNotNone(command, action)
             result = self.run_cli(*shlex.split(command.group(1))[1:])
@@ -1109,20 +1111,44 @@ class ScenarioCase(ProjectCase):
             result = self.run_cli("transition", name.group(1), "spec_ready", "--as", "spec_author")
             self.assertEqual(result.returncode, 0, result.stderr)
         elif actor == "implementer":
-            self.implement(name.group(1))
+            self.implement(name.group(1), is_debt)
         elif actor == "reviewer":
-            self.write_review(name.group(1), self.verdicts.pop(0) if self.verdicts else "APPROVED")
+            verdict = self.verdicts.pop(0) if self.verdicts else "APPROVED"
+            self.review(name.group(1), verdict, is_debt)
         else:
             self.fail(f"unknown actor in: {action}")
 
-    def implement(self, name):
+    def implement(self, name, is_debt=False):
         self.attempts += 1
-        tasks = self.path(f".harness/specs/{name}/tasks.md")
-        if tasks.exists():
-            tasks.write_text(tasks.read_text().replace("- [ ]", "- [x]"))
+        if not is_debt and not self.work_through_tasks(name):
+            return
         self.write("src/app/traced.py", "test_it = None\n")
-        self.write(f".harness/progress/impl_{name}.md",
+        report = f"impl_debt-{name}" if is_debt else f"impl_{name}"
+        self.write(f".harness/progress/{report}.md",
                    f"## Traceability\n- R1 → `test_it`\n\nattempt {self.attempts}\n")
+
+    def work_through_tasks(self, name):
+        """Start and tick each open task. False when the session dies mid-task."""
+        tasks = self.path(f".harness/specs/{name}/tasks.md")
+        if not tasks.exists():
+            return True
+        for task in re.findall(r"^- \[ \] (T\d+)", tasks.read_text(), re.MULTILINE):
+            result = self.run_cli("task", "start", name, task)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if task == self.crash_at:
+                self.crash_at = None
+                return False
+            tasks.write_text(tasks.read_text().replace(f"- [ ] {task}", f"- [x] {task}"))
+        return True
+
+    def review(self, name, verdict, is_debt):
+        if not is_debt:
+            self.write_review(name, verdict)
+            return
+        stored = next(d for d in self.read_json(DEBTS)["debts"] if d["name"] == name)
+        lines = [f"- A{n}: [x] verified" for n in range(1, len(stored["acceptance"]) + 1)]
+        self.write(f".harness/progress/review_debt-{name}.md",
+                   f"**Verdict:** {verdict}\n\n## Acceptance\n" + "\n".join(lines) + "\n")
 
     def assert_finished(self, name="alpha"):
         self.assertEqual(self.status(name), "done")
@@ -1199,6 +1225,576 @@ class ScenarioTests(ScenarioCase):
         self.assertTrue(all("alpha" in a for a in trail[:first_beta]), trail)
 
 
+class DebtScenarioTests(ScenarioCase):
+    def stored(self, name="owed"):
+        return next(d for d in self.read_json(DEBTS)["debts"] if d["name"] == name)
+
+    def start(self, name="owed"):
+        result = self.run_cli("debt", "start", name)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_sdd_false_debt_is_paid_and_resolved(self):
+        self.set_debts(debt(name="owed", acceptance=["first", "second"]))
+        self.start()
+        trail = self.play()
+        self.assertEqual([a.split(":")[0] for a in trail[:-1]], ["implementer", "reviewer", "leader"])
+        self.assertIn("harness debt resolve owed", trail[2])
+        self.assertEqual(self.stored()["status"], "resolved")
+        self.assertEqual(sorted(self.stored()["evidence"]), ["impl_debt-owed.md", "review_debt-owed.md"])
+        self.assertEqual(self.run_cli("check").returncode, 0)
+
+    def test_accepted_debt_can_be_paid(self):
+        self.set_debts(debt(name="owed", status="accepted"))
+        self.start()
+        self.play()
+        self.assertEqual(self.stored()["status"], "resolved")
+
+    def test_debt_rejected_then_fixed(self):
+        self.set_debts(debt(name="owed"))
+        self.start()
+        trail = self.play(verdicts=["CHANGES_REQUESTED"])
+        self.assertEqual([a.split(":")[0] for a in trail[:-1]],
+                         ["implementer", "reviewer", "implementer", "reviewer", "leader"])
+        self.assertIn("review_debt-owed.md", trail[2])
+        self.assertEqual(self.stored()["status"], "resolved")
+
+    def test_critical_debt_goes_before_pending_features(self):
+        self.set_features(feature(sdd=False))
+        self.set_debts(debt(name="owed", severity="critical"))
+        trail = self.play()
+        self.assertIn("harness debt start owed", trail[0])
+        self.assertEqual(self.stored()["status"], "resolved")
+        self.assert_finished()
+        first_feature = next(i for i, action in enumerate(trail) if "alpha" in action)
+        self.assertTrue(any("debt resolve owed" in action for action in trail[:first_feature]), trail)
+
+    def test_critical_sdd_debt_is_never_offered_a_start_that_would_be_refused(self):
+        self.set_debts(debt(name="owed", severity="critical", sdd=True))
+        action = self.run_cli("next").stdout
+        self.assertIn("triage critical debt owed", action)
+        self.assertNotIn("debt start", action)
+        self.assertNotEqual(self.run_cli("debt", "start", "owed").returncode, 0)
+
+    def test_critical_sdd_debt_promoted_after_triage_reaches_done(self):
+        self.set_features(feature("owed", sdd=False))
+        self.set_debts(debt(name="owed", severity="critical", sdd=True, status="scheduled"))
+        self.play()
+        self.assert_finished("owed")
+        self.assertEqual(self.stored()["status"], "resolved")
+
+    def test_feature_and_debt_are_never_active_together(self):
+        self.set_features(feature(sdd=False, status="in_progress"), feature("beta", sdd=False, id=2))
+        self.set_debts(debt(name="owed"))
+        refused = self.run_cli("debt", "start", "owed")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("another feature is in_progress", refused.stderr)
+        self.assertEqual(self.stored()["status"], "open")
+        self.play()
+        self.assert_finished()
+        self.start()
+        self.play()
+        self.assertEqual(self.stored()["status"], "resolved")
+
+    def test_active_debt_keeps_features_waiting(self):
+        self.set_features(feature(sdd=False))
+        self.set_debts(debt(name="owed"))
+        self.start()
+        refused = self.run_cli("transition", "alpha", "in_progress")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("a debt is in_progress: owed", refused.stderr)
+        self.play()
+        self.assert_finished()
+
+    def test_two_debts_are_never_active_together(self):
+        self.set_debts(debt(name="owed"), debt(id=2, name="more"))
+        self.start()
+        self.assertNotEqual(self.run_cli("debt", "start", "more").returncode, 0)
+
+
+class InterruptionScenarioTests(ScenarioCase):
+    TASKS = "- [ ] T1 — one. Covers: R1.\n- [ ] T2 — two. Covers: R1.\n- [ ] T3 — three. Covers: R1.\n"
+
+    def in_progress(self):
+        self.write_spec(tasks=self.TASKS)
+        self.set_features(feature(status="spec_ready"))
+        self.approve()
+        self.assertEqual(self.run_cli("transition", "alpha", "in_progress").returncode, 0)
+
+    def test_interrupted_task_is_resumed_to_done(self):
+        self.in_progress()
+        trail = self.play(crash_at="T2")
+        self.assertEqual(trail[0], "implementer: implement feature alpha")
+        self.assertEqual(trail[1], "implementer: resume alpha at T2 (started, not finished)")
+        self.assert_finished()
+
+    def test_interruption_after_the_report_still_routes_to_resume(self):
+        self.in_progress()
+        self.write("src/app/traced.py", "test_it = None\n")
+        self.write_impl()
+        self.assertEqual(self.run_cli("task", "start", "alpha", "T1").returncode, 0)
+        self.assertIn("resume alpha at T1", self.run_cli("next").stdout)
+
+    def test_ticking_clears_the_interruption(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T1")
+        self.write(".harness/specs/alpha/tasks.md", self.TASKS.replace("[ ] T1", "[x] T1"))
+        self.assertNotIn("resume", self.run_cli("next").stdout)
+
+    def test_starting_another_task_warns_and_succeeds(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T1")
+        result = self.run_cli("task", "start", "alpha", "T2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[WARN]", result.stdout)
+        self.assertIn("T1", result.stdout)
+
+    def test_restarting_the_same_task_does_not_warn(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T1")
+        self.assertNotIn("[WARN]", self.run_cli("task", "start", "alpha", "T1").stdout)
+
+    def test_start_records_the_task_and_a_log_line(self):
+        self.in_progress()
+        self.assertEqual(self.run_cli("task", "start", "alpha", "T1").returncode, 0)
+        record = self.read_json(".harness/state/tasks.json")
+        self.assertEqual(record["feature"], "alpha")
+        self.assertEqual(record["started"][0]["task"], "T1")
+        self.assertTrue(record["started"][0]["started_at"])
+        log = self.path(".harness/progress/current.md").read_text()
+        self.assertIn("task start alpha T1", log)
+        self.assertNotIn("## Log\n\n_—_", log)
+        self.assertLess(log.index("task start alpha T1"), log.index("## Next Step"))
+
+    def test_log_lines_accumulate(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T1")
+        self.run_cli("task", "start", "alpha", "T2")
+        log = self.path(".harness/progress/current.md").read_text()
+        self.assertLess(log.index("alpha T1"), log.index("alpha T2"))
+
+    def test_start_adds_a_log_section_when_missing(self):
+        self.in_progress()
+        self.write(".harness/progress/current.md", "# Current Session\n")
+        self.assertEqual(self.run_cli("task", "start", "alpha", "T1").returncode, 0)
+        self.assertIn("## Log", self.path(".harness/progress/current.md").read_text())
+
+    def test_start_refuses_invalid_targets(self):
+        self.in_progress()
+        self.write(".harness/specs/alpha/tasks.md", self.TASKS.replace("[ ] T1", "[x] T1"))
+        for args, expected in ((("alpha", "T9"), "no task T9"), (("alpha", "T1"), "already ticked"),
+                               (("nope", "T1"), "unknown feature")):
+            with self.subTest(args=args):
+                result = self.run_cli("task", "start", *args)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
+    def test_start_refuses_a_feature_that_is_not_active(self):
+        self.write_spec()
+        self.set_features(feature(status="spec_ready"))
+        self.assertIn("not in_progress", self.run_cli("task", "start", "alpha", "T1").stderr)
+
+    def test_start_refuses_a_feature_without_tasks(self):
+        self.set_features(feature(sdd=False, status="in_progress"))
+        self.assertIn("no tasks", self.run_cli("task", "start", "alpha", "T1").stderr)
+
+    def test_damaged_task_record_fails_check_but_not_next(self):
+        self.in_progress()
+        self.write(".harness/state/tasks.json", "[]")
+        self.assert_check_fails("must hold a started list")
+        self.assertEqual(self.run_cli("next").returncode, 0)
+
+
+class DebtGuardTests(HookCase):
+    def paying(self, **fields):
+        self.set_debts(debt(name="owed", status="in_progress", acceptance=["one", "two"], **fields))
+        self.write(".harness/progress/impl_debt-owed.md", "paid\n")
+
+    def write_debt_review(self, verdict="APPROVED", lines="- A1: [x] a\n- A2: [x] b\n"):
+        self.write(".harness/progress/review_debt-owed.md", f"**Verdict:** {verdict}\n\n{lines}")
+
+    def assert_refused(self, expected):
+        before = self.path(DEBTS).read_bytes()
+        result = self.run_cli("debt", "resolve", "owed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(expected, result.stderr)
+        self.assertEqual(self.path(DEBTS).read_bytes(), before)
+
+    def test_resolve_needs_a_report(self):
+        self.paying()
+        self.path(".harness/progress/impl_debt-owed.md").unlink()
+        self.write_debt_review()
+        self.assert_refused("no implementation report")
+
+    def test_resolve_needs_a_review(self):
+        self.paying()
+        self.assert_refused("no review report")
+
+    def test_resolve_refuses_a_rejection(self):
+        self.paying()
+        self.write_debt_review("CHANGES_REQUESTED")
+        self.assert_refused("not APPROVED")
+
+    def test_resolve_refuses_a_stale_review(self):
+        self.paying()
+        self.write_debt_review()
+        os.utime(self.path(".harness/progress/review_debt-owed.md"), (1, 1))
+        self.assert_refused("older than")
+
+    def test_resolve_refuses_a_missing_acceptance_line(self):
+        self.paying()
+        self.write_debt_review(lines="- A1: [x] a\n")
+        self.assert_refused("acceptance not covered by the review: A2")
+
+    def test_resolve_refuses_an_unticked_acceptance_line(self):
+        self.paying()
+        self.write_debt_review(lines="- A1: [x] a\n- A2: [ ] b\n")
+        self.assert_refused("A2")
+
+    def test_acceptance_lines_in_code_fences_do_not_count(self):
+        self.paying()
+        self.write_debt_review(lines="```\n- A1: [x] a\n- A2: [x] b\n```\n")
+        self.assert_refused("A1, A2")
+
+    def test_resolve_refuses_failing_tests(self):
+        self.paying()
+        self.write_debt_review()
+        self.write("src/tests/test_app.py",
+                   "import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.fail('no')\n")
+        self.assert_refused("tests failed")
+        self.assertTrue(self.run_cli("next").stdout.startswith("implementer:"))
+
+    def test_resolve_only_from_in_progress(self):
+        self.set_debts(debt(name="owed"))
+        self.assertIn("illegal move", self.run_cli("debt", "resolve", "owed").stderr)
+
+    def test_start_refuses_debt_that_is_not_payable_in_place(self):
+        for fields, expected in (({"sdd": True}, "promoting"), ({"status": "scheduled"}, "illegal move"),
+                                 ({"status": "wontfix"}, "illegal move")):
+            with self.subTest(fields=fields):
+                self.set_debts(debt(name="owed", **fields))
+                result = self.run_cli("debt", "start", "owed")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
+    def test_unknown_debt_is_an_error(self):
+        self.assertIn("unknown debt", self.run_cli("debt", "start", "nope").stderr)
+
+    def test_debt_names_must_be_slugs(self):
+        self.set_debts(debt(name="../escape"))
+        self.assert_check_fails("lowercase slug")
+
+    def closed(self):
+        self.paying()
+        self.write_debt_review()
+        result = self.run_cli("debt", "resolve", "owed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_resolved_debt_survives_shuffled_file_times(self):
+        self.closed()
+        os.utime(self.path(".harness/progress/review_debt-owed.md"), (1, 1))
+        self.assert_check_passes()
+
+    def test_edited_evidence_of_a_resolved_debt_fails_check(self):
+        self.closed()
+        self.write(".harness/progress/impl_debt-owed.md", "changed\n")
+        self.assert_check_fails("evidence changed after the debt closed")
+
+    def test_resolved_debt_needs_evidence(self):
+        self.set_debts(debt(name="owed", status="resolved"))
+        self.assert_check_fails("resolved without evidence")
+
+    def test_a_feature_and_a_debt_active_fail_check(self):
+        self.paying()
+        self.set_features(feature(sdd=False, status="in_progress"))
+        self.assert_check_fails("more than one thing is in_progress")
+
+    def edited(self, **changes):
+        doc = self.read_json(DEBTS)
+        doc["debts"][0].update(changes)
+        return self.write_call(DEBTS, "leader", json.dumps(doc))
+
+    def test_hand_edits_cannot_start_or_resolve_a_debt(self):
+        self.set_debts(debt(name="owed"))
+        self.assert_blocked(self.edited(status="in_progress"))
+        self.assert_blocked(self.edited(status="resolved"))
+        self.assert_allowed(self.edited(status="accepted"))
+
+    def test_new_debt_cannot_be_born_active(self):
+        doc = self.read_json(DEBTS)
+        doc["debts"].append(debt(status="in_progress"))
+        self.assert_blocked(self.write_call(DEBTS, "leader", json.dumps(doc)))
+
+    def test_active_debt_terms_are_frozen(self):
+        self.paying()
+        self.assert_blocked(self.edited(acceptance=["one"]))
+        self.assert_blocked(self.edited(sdd=True))
+        self.assert_blocked(self.edited(name="other"))
+        self.assert_allowed(self.edited(title="clearer"))
+
+    def test_active_debt_cannot_be_removed_but_can_be_abandoned(self):
+        self.paying()
+        doc = self.read_json(DEBTS)
+        doc["debts"] = []
+        self.assert_blocked(self.write_call(DEBTS, "leader", json.dumps(doc)))
+        self.assert_allowed(self.edited(status="accepted"))
+
+    def test_no_agent_can_remove_a_debt_or_wipe_the_ledger(self):
+        self.set_debts(debt(name="owed"))
+        doc = self.read_json(DEBTS)
+        doc["debts"] = []
+        self.assert_blocked(self.write_call(DEBTS, "leader", json.dumps(doc)))
+        self.assert_blocked(self.write_call(DEBTS, "leader", "{}"))
+
+    def test_only_a_human_can_defuse_a_critical_debt(self):
+        self.set_debts(debt(name="owed", severity="critical"))
+        self.assert_blocked(self.edited(severity="low"))
+        self.assert_blocked(self.edited(status="accepted"))
+        self.assert_blocked(self.edited(status="wontfix"))
+        self.assert_allowed(self.edited(title="clearer"))
+
+    def test_leader_still_triages_a_debt_that_is_not_critical(self):
+        self.set_debts(debt(name="owed", severity="high"))
+        self.assert_allowed(self.edited(severity="low"))
+        self.assert_allowed(self.edited(status="wontfix"))
+
+    def test_evidence_fields_are_harness_only(self):
+        self.set_debts(debt(name="owed"))
+        self.assert_blocked(self.edited(evidence={"a": "b"}))
+        self.assert_blocked(self.edited(resolved_by={"feature": "x"}))
+
+    def test_only_the_leader_runs_debt_commands(self):
+        for agent in ("implementer", "reviewer", "spec_author", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.bash("harness debt resolve owed", agent))
+        self.assert_allowed(self.bash("harness debt start owed", "leader"))
+        self.assert_allowed(self.bash(".harness/bin/harness debt resolve owed"))
+
+    def test_only_the_implementer_runs_task_start(self):
+        for agent in ("leader", "reviewer", "spec_author", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.bash("harness task start alpha T1", agent))
+        self.assert_blocked(self.bash("harness task start alpha T1"))
+        self.assert_allowed(self.bash(".harness/bin/harness task start alpha T1", "implementer"))
+
+    def test_guarded_commands_cannot_hide_behind_a_variable(self):
+        self.assert_blocked(self.bash("$H task start alpha T1", "leader"))
+        self.assert_blocked(self.bash("$H debt resolve owed", "implementer"))
+        self.assert_blocked(self.bash("harness $SUB start alpha T1", "implementer"))
+
+    def test_task_record_is_harness_owned(self):
+        for agent in ("leader", "implementer", "reviewer"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.write_call(".harness/state/tasks.json", agent, "{}"))
+                self.assert_blocked(self.bash("echo x > .harness/state/tasks.json", agent))
+
+
+class ResumeTests(ProjectCase):
+    TASKS = "- [x] T1 — one. Covers: R1.\n- [ ] T2 — two. Covers: R1.\n"
+
+    def in_progress(self, tasks=None):
+        self.write_spec(tasks=tasks or self.TASKS)
+        self.set_features(feature(status="spec_ready"))
+        self.approve()
+        self.set_features(feature(status="in_progress"))
+
+    def briefing(self):
+        result = self.run_cli("resume", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_nothing_active_prints_a_short_message(self):
+        result = self.run_cli("resume")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no active work", result.stdout)
+        self.assertLessEqual(len(result.stdout.splitlines()), 2)
+
+    def test_reports_the_active_feature(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T2")
+        self.write_impl()
+        self.write_review(verdict="CHANGES_REQUESTED")
+        text = self.run_cli("resume").stdout
+        for expected in ("Active feature: alpha (in_progress)", "1 done, 1 pending", "T2 (started",
+                         "Spec: .harness/specs/alpha/", "Latest review: CHANGES_REQUESTED",
+                         "task start alpha T2", ".harness/specs/alpha/tasks.md", "resume alpha at T2"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+
+    def test_reports_an_active_debt(self):
+        self.set_debts(debt(name="owed", status="in_progress"))
+        data = self.briefing()
+        self.assertEqual((data["active"]["kind"], data["active"]["name"]), ("debt", "owed"))
+        self.assertIsNone(data["tasks"])
+        self.assertIn("pay debt owed", data["next_action"])
+
+    def test_json_has_the_documented_keys(self):
+        self.in_progress()
+        self.assertEqual(sorted(self.briefing()),
+                         ["active", "changed_files", "changed_files_note", "log", "next_action",
+                          "next_may_differ", "project", "read_next", "review", "spec_path", "tasks"])
+
+    def test_never_runs_tests(self):
+        marker = self.path("ran-tests")
+        config = self.read_json(CONFIG)
+        config["commands"]["test"] = f"touch {marker}"
+        self.write(CONFIG, json.dumps(config))
+        self.make_done_ready()
+        self.set_features(feature(status="in_progress"))
+        self.assertEqual(self.run_cli("resume").returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_never_scans_for_traceability(self):
+        self.make_done_ready()
+        self.set_features(feature(status="in_progress"))
+        self.path("src/app/traced.py").unlink()
+        self.assertIn("transition alpha done", self.briefing()["next_action"])
+
+    def test_says_when_next_may_differ(self):
+        self.make_done_ready()
+        self.set_features(feature(status="in_progress"))
+        self.write("src/tests/test_app.py",
+                   "import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.fail('no')\n")
+        text = self.run_cli("resume").stdout
+        self.assertIn("transition alpha done", text)
+        self.assertIn("`harness next` may route elsewhere", text)
+        self.assertTrue(self.run_cli("next").stdout.startswith("implementer:"))
+
+    def test_does_not_warn_when_the_action_cannot_differ(self):
+        self.in_progress()
+        self.assertFalse(self.briefing()["next_may_differ"])
+        self.assertNotIn("may route elsewhere", self.run_cli("resume").stdout)
+
+    def test_is_read_only(self):
+        self.in_progress()
+        self.run_cli("task", "start", "alpha", "T2")
+        before = {p: p.read_bytes() for p in self.path(".harness").rglob("*") if p.is_file()}
+        self.run_cli("resume")
+        self.run_cli("resume", "--json")
+        after = {p: p.read_bytes() for p in self.path(".harness").rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+
+    def test_lists_are_capped_and_counted(self):
+        tasks = "".join(f"- [ ] T{n} — task. Covers: R1.\n" for n in range(1, 41))
+        self.in_progress(tasks=tasks)
+        for n in range(1, 41):
+            self.run_cli("task", "start", "alpha", f"T{n}")
+            self.write(f"src/generated_{n}.py", "x = 1\n")
+        result = self.run_cli("resume")
+        self.assertLess(len(result.stdout.splitlines()), 60, result.stdout)
+        self.assertIn("30 more omitted", result.stdout)
+        self.assertIn("32 more omitted", result.stdout)
+        data = self.briefing()
+        self.assertEqual(len(data["tasks"]["pending"]["items"]), 10)
+        self.assertEqual(data["tasks"]["pending"]["omitted"], 30)
+        self.assertEqual(len(data["changed_files"]["items"]), 10)
+        self.assertEqual(data["log"]["omitted"], 32)
+
+    def test_long_lines_are_cut(self):
+        self.in_progress(tasks=f"- [ ] T1 — {'x' * 500}. Covers: R1.\n")
+        self.assertLessEqual(max(len(l) for l in self.run_cli("resume").stdout.splitlines()), 160)
+
+    def test_lists_changed_and_untracked_files_in_the_app_only(self):
+        self.in_progress()
+        self.write("outside.txt", "x")
+        files = self.briefing()["changed_files"]["items"]
+        self.assertTrue(any("src/app/__init__.py" in line for line in files), files)
+        self.assertFalse(any("outside.txt" in line for line in files), files)
+
+    def test_tolerates_no_commits(self):
+        self.in_progress()
+        self.assertIsNone(self.briefing()["changed_files_note"])
+
+    def test_tolerates_a_folder_outside_git(self):
+        self.in_progress()
+        shutil.rmtree(self.path(".git"))
+        self.assertEqual(self.briefing()["changed_files_note"], "not a git repository")
+        self.assertIn("Changed files: unknown", self.run_cli("resume").stdout)
+
+    def test_tolerates_git_being_unavailable(self):
+        self.in_progress()
+        empty = Path(self.tmp) / "emptybin"
+        empty.mkdir()
+        result = subprocess.run([sys.executable, str(self.cli), "resume", "--json"], cwd=str(self.root),
+                                capture_output=True, text=True, env={"PATH": str(empty)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["changed_files_note"], "git is not available")
+
+    def test_uninitialized_scaffold_is_a_clean_error(self):
+        result = subprocess.run([sys.executable, str(CLI), "resume"], cwd=str(SOURCE), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not initialized", result.stderr)
+
+
+class SessionStartTests(ProjectCase):
+    def session_start(self):
+        return self.run_cli("hook", "session-start", input_text='{"source": "startup"}')
+
+    def context(self):
+        result = self.session_start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "SessionStart")
+        return output["additionalContext"]
+
+    def test_injects_the_briefing(self):
+        self.write_spec()
+        self.set_features(feature(status="spec_ready"))
+        self.approve()
+        self.set_features(feature(status="in_progress"))
+        self.run_cli("task", "start", "alpha", "T1")
+        context = self.context()
+        self.assertIn("T1 (started", context)
+        self.assertIn("resume alpha at T1", context)
+
+    def test_injects_a_short_message_with_nothing_active(self):
+        self.assertIn("no active work", self.context())
+
+    def test_stays_under_the_documented_context_cap(self):
+        self.set_features(feature(title="x" * 20000, status="in_progress", sdd=False))
+        self.assertLess(len(self.context()), 10000)
+
+    def test_never_blocks_on_corrupt_state(self):
+        self.write(FEATURES, "{ nope")
+        self.assertIn("briefing unavailable", self.context())
+
+    def test_never_blocks_on_missing_rules(self):
+        self.path(RULES).unlink()
+        self.assertIn("briefing unavailable", self.context())
+
+    def test_never_blocks_on_missing_config(self):
+        self.path(CONFIG).unlink()
+        self.assertIn("briefing unavailable", self.context())
+
+    def test_never_blocks_on_unreadable_stdin(self):
+        result = self.run_cli("hook", "session-start", input_text="not json")
+        self.assertEqual(result.returncode, 0)
+
+    def test_is_passive_in_the_scaffold(self):
+        config = self.read_json(CONFIG)
+        config["stack"] = None
+        self.write(CONFIG, json.dumps(config))
+        result = self.session_start()
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+
+    def test_settings_wire_the_hook_in_exec_form(self):
+        settings = self.read_json(".claude/settings.json")
+        hook = settings["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(hook["args"], ["hook", "session-start"])
+        self.assertEqual(hook["type"], "command")
+
+    def test_missing_session_start_hook_is_reported(self):
+        settings = self.read_json(".claude/settings.json")
+        del settings["hooks"]["SessionStart"]
+        self.write(".claude/settings.json", json.dumps(settings))
+        self.assert_check_fails("does not run the harness SessionStart hook")
+
+    def test_missing_pre_tool_use_hook_is_still_reported(self):
+        settings = self.read_json(".claude/settings.json")
+        del settings["hooks"]["PreToolUse"]
+        self.write(".claude/settings.json", json.dumps(settings))
+        self.assert_check_fails("does not run the harness PreToolUse hook")
+
+
 class LifecycleRegressionTests(ProjectCase):
     def promoted(self):
         self.make_done_ready("owed")
@@ -1243,7 +1839,7 @@ class LifecycleRegressionTests(ProjectCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.state_files(), before)
         self.assertEqual(sorted(p.name for p in self.path(".harness/state").iterdir()),
-                         ["feature_list.json", "techdebt_list.json"])
+                         ["feature_list.json", "tasks.json", "techdebt_list.json"])
 
     def test_closing_leaves_unrelated_debt_alone(self):
         self.promoted()

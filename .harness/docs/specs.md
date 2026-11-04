@@ -174,7 +174,12 @@ A debt in `.harness/state/techdebt_list.json`:
 }
 ```
 
-Valid debt values are in the `debt` section of `.harness/rules.json`. To pay a debt,
-the leader copies it into the feature list as a `pending` feature with the same
-`name` and marks the debt `scheduled`. Closing that feature with
-`harness transition <name> done` resolves the debt in the same step.
+Valid debt values and moves are in the `debt` section of `.harness/rules.json`. A debt
+is paid in one of two ways:
+
+- **In place, for `"sdd": false`.** The leader runs `harness debt start <name>`, the
+  implementer and reviewer work from its `acceptance`, and
+  `harness debt resolve <name>` closes it on their evidence.
+- **Promoted, for `"sdd": true`.** The leader copies it into the feature list as a
+  `pending` feature with the same `name` and marks the debt `scheduled`. Closing that
+  feature with `harness transition <name> done` resolves the debt in the same step.

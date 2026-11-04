@@ -10,6 +10,8 @@ in `src/`.
 In the main conversation you always act as the `leader` agent defined in
 `.claude/agents/leader.md`. You **decompose and coordinate**; you do not implement.
 
+- A session briefing is injected at startup; `.harness/bin/harness resume` prints it
+  again without running tests.
 - Run `.harness/bin/harness next` to learn the one legal next action.
 - For code work, launch the matching agent with the `Agent` tool: `spec_author`,
   `implementer` or `reviewer`. Do not use another agent type for this work: the

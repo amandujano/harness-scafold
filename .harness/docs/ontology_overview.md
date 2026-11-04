@@ -58,9 +58,11 @@ flowchart TB
 ```
 
 `.harness/bin/harness` is the only code. `check` validates state and runs tests, `next`
-prints one action, `transition` changes a status under its guards, `approve` records
-a human decision, and `hook pre-tool-use` runs before Write, Edit, MultiEdit,
-NotebookEdit and Bash through `.claude/settings.json`.
+prints one action, `transition` and `debt` change a status under their guards,
+`approve` records a human decision, `task start` traces progress, and `resume` prints a
+state-only briefing. `hook pre-tool-use` runs before Write, Edit, MultiEdit, NotebookEdit
+and Bash, and `hook session-start` injects the briefing, both through
+`.claude/settings.json`.
 
 ## 3. Lifecycle
 
@@ -95,6 +97,12 @@ goes back to the reviewer.
   debt of the same `name` as one step, and its guards evaluate that outcome.
 - **Approval binds content.** Approval stores spec hashes that ignore checkbox state,
   so ticking a task is progress while any other edit voids the approval.
+- **Paying debt in place.** `harness debt` reuses the feature evidence function, so
+  rejection loops, staleness and evidence hashes behave the same. An `sdd: false` debt
+  counts against the single-active rule, and its `acceptance` is frozen while it is paid.
+- **Two next paths.** `next` runs slow guards and tests so it cannot offer a step that
+  would be refused. `resume` must stay fast, so it stops at state and says when `next`
+  may route elsewhere.
 - **Scaffold mode.** With `"stack": null` the hook is passive, so the harness itself
   can be developed. `.harness/config.json` is not writable by agents in a project.
 

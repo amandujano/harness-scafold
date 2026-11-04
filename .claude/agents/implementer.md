@@ -31,9 +31,14 @@ You are an implementer. Your job is to execute **a single** feature from
    - `Feature in progress: <id> — <name>`
    - `Plan: tasks T1..Tn from .harness/specs/<name>/tasks.md`
 3. **For each task `T<n>` in order**:
-   a. Implement the change the task describes.
-   b. If the task includes a test, write it.
-   c. Mark `[x] T<n>` in `tasks.md`. Ticking is the only edit you may make to it.
+   a. Run `.harness/bin/harness task start <name> T<n>`. This is what lets a later
+      session see where you stopped.
+   b. Implement the change the task describes.
+   c. If the task includes a test, write it.
+   d. Mark `[x] T<n>` in `tasks.md`. Ticking is the only edit you may make to it.
+
+   If you are told to resume at `T<n>`, read what is already in `src/` first: the
+   interrupted task may have left partial work.
 4. **Traceability**: confirm that every `R<n>` is covered by at least
    one concrete test. Record it in `.harness/progress/impl_<name>.md`
    (`- R<n> → test` map). For `"sdd": false`, map each `acceptance` item to a test
@@ -46,6 +51,12 @@ You are an implementer. Your job is to execute **a single** feature from
 6. **Do not change the feature status.** The reviewer decides, and the leader
    runs the guarded transition. If the reviewer requests changes, you are launched
    again on the same `in_progress` feature; update the report when you finish.
+
+## Paying a debt
+
+When your brief names a debt, its `acceptance` list is your specification. Make every
+item true, then write `.harness/progress/impl_debt-<name>.md`. There are no tasks to
+start. Do not change the debt entry.
 
 ## Recording technical debt
 

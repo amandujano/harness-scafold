@@ -8,13 +8,14 @@
 ## C1 — The Harness is Complete
 
 - [ ] **[auto]** Every file in `required_files` of `.harness/rules.json` exists.
-- [ ] **[auto]** `.claude/settings.json` runs the harness hook.
+- [ ] **[auto]** `.claude/settings.json` runs the harness PreToolUse and SessionStart
+      hooks.
 - [ ] **[auto]** `.harness/bin/harness check` exits 0.
 
 ## C2 — State is Consistent
 
 - [ ] **[auto]** State files are valid and use only known statuses.
-- [ ] **[auto]** At most one feature is `in_progress`.
+- [ ] **[auto]** At most one feature or debt is `in_progress`.
 - [ ] **[auto]** Every `done` feature has an implementation report and a current
       APPROVED review.
 - [ ] `.harness/progress/current.md` is empty or describes the active session.
@@ -53,6 +54,7 @@
 - [ ] **[auto]** Every debt has verifiable fields: non-empty `acceptance`, and an
       `origin` naming agent, feature and session.
 - [ ] **[auto]** No `critical` debt is `open`.
+- [ ] **[auto]** Every `resolved` debt has current evidence or the feature that paid it.
 - [ ] **[auto]** Every `scheduled` debt with `sdd: true` has a feature with the same
       `name` that is not `done`.
 - [ ] Every `acceptance` item is genuinely verifiable.

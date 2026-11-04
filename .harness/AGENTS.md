@@ -9,9 +9,10 @@
 
 ## 1. Before Starting
 
-1. Run `.harness/bin/harness check`. If it fails, **stop** and resolve it.
-2. Run `.harness/bin/harness next`. It prints the one legal next action.
-3. Read `.harness/progress/current.md` for the state of the last session.
+1. Read the session briefing. Claude Code injects it at session start; to see it
+   again, run `.harness/bin/harness resume`.
+2. Run `.harness/bin/harness check`. If it fails, **stop** and resolve it.
+3. Run `.harness/bin/harness next`. It prints the one legal next action.
 4. Read `.harness/docs/specs.md` before touching any spec or `sdd: true` feature.
 
 ## 2. Repository Map
@@ -23,6 +24,7 @@
 | `.harness/rules.json` | States, transitions, role permissions, invariants | When a rule is unclear |
 | `.harness/state/feature_list.json` | Features and their status | Always |
 | `.harness/state/techdebt_list.json` | Ledger of shortcuts taken by agents | Always; and whenever you take a shortcut |
+| `.harness/state/tasks.json` | Tasks started, written only by `harness task start` | Never by hand |
 | `.harness/progress/current.md` | Current session state | Always |
 | `.harness/progress/history.md` | Append-only log of previous sessions | For historical context |
 | `.harness/specs/<feature>/` | `requirements.md`, `design.md`, `tasks.md` | Before implementing an `sdd: true` feature |
@@ -59,7 +61,24 @@ both         in_progress → [implementer → reviewer] → done
 `CHANGES_REQUESTED` keeps the feature `in_progress` and loops implementer →
 reviewer until `APPROVED`. The leader then runs `harness transition <name> done`.
 
-## 5. Session Closure
+To pay a debt in place, the leader runs `harness debt start <name>`, the same
+implementer and reviewer loop follows, and `harness debt resolve <name>` closes it.
+Only one feature or debt is active at a time.
+
+## 5. Recovery
+
+**What survives an interruption:** everything on disk, meaning feature and debt
+status, specs, reports, the log, and which task was started and not ticked.
+
+**How to resume:** start a session. The briefing names the active work and any task
+in flight, and `harness next` says `implementer: resume <feature> at T3`. The leader
+asks the human whether to resume or to block.
+
+**Limits:** uncommitted code in `src/` is not a restore point: it is whatever the
+interrupted task left, possibly half-written. Read it before continuing. Committing
+per task is a human decision and is not automated.
+
+## 6. Session Closure
 
 1. Run `.harness/bin/harness check`: it must pass.
 2. Confirm no `critical` debt is `open`; if there is, the session does not close.
@@ -68,7 +87,7 @@ reviewer until `APPROVED`. The leader then runs `harness transition <name> done`
 4. Reset `current.md` from `.harness/templates/progress_current.md`.
 5. Do not leave temporary files, debug output, or contextless TODOs.
 
-## 6. If You Get Stuck
+## 7. If You Get Stuck
 
 - Reread the relevant file in `.harness/docs/`.
 - If a tool does not do what you expect, or the hook blocks you, **do not invent a

@@ -40,6 +40,22 @@ changes. You do not edit code. The only file you write is your verdict.
    - You may not change any debt's `status`. Triage belongs to the leader.
 6. Issue a verdict.
 
+## Reviewing a debt
+
+When your brief names a debt, verify each item of its `acceptance` list against the
+code and `.harness/progress/impl_debt-<name>.md`. Write the verdict to
+`.harness/progress/review_debt-<name>.md`, with one line per item, numbered in list
+order. `harness` reads these lines and refuses to resolve a debt with any item
+missing or unticked:
+
+```markdown
+**Verdict:** APPROVED
+
+## Acceptance
+- A1: [x] <what proves it>
+- A2: [x] <what proves it>
+```
+
 ## Verdict format
 
 Your final output is **a single block** written to
