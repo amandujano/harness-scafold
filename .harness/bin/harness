@@ -3025,7 +3025,7 @@ def cmd_ci_github(args):
     workflow.parent.mkdir(parents=True, exist_ok=True)
     workflow.write_text(render_workflow(steps), encoding="utf-8")
     ok(f"wrote {WORKFLOW}")
-    if not steps:
+    if "ci" not in stack:
         warn(f"stack {config['stack']} declares no CI setup: add your toolchain steps before the "
              f"harness check step in {WORKFLOW}")
     return 0

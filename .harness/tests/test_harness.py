@@ -887,6 +887,13 @@ class HumanGateTests(ProjectCase):
         self.assertTrue(record["approved_at"])
 
 
+class CiWarningTests(ProjectCase):
+    def test_a_stack_needing_no_extra_steps_gets_no_warning(self):
+        result = self.run_cli("ci", "github")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("no CI setup", result.stdout + result.stderr)
+
+
 class EvidenceRestampTests(ProjectCase):
     def closed(self):
         self.make_done_ready()

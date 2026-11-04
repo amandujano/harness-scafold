@@ -293,8 +293,9 @@ Limits you should know:
 - The hook governs Claude Code only. Your editor and terminal are not restricted.
 - `harness check` confirms each requirement maps to a name that occurs in `src/`.
   Judging that the test is meaningful stays with the reviewer.
-- The generated workflow has not yet run on GitHub, and recovery from an update killed
-  midway is untested. Use `harness update --dry-run` first on an important project.
+- The generated workflow has run on GitHub for the python stack only, and it does not
+  install ast-grep, so code rules are skipped there. Recovery from an update killed midway
+  is untested: use `harness update --dry-run` first on an important project.
 
 ## Add a Stack
 

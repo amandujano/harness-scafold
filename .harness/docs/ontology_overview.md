@@ -143,7 +143,7 @@ goes back to the reviewer.
   line. Only the sandbox covers them, and only for the paths above.
 - The hook governs Claude Code only. `harness ci github` adds a workflow that runs
   `harness check` on every push, which also covers changes made outside Claude Code.
-  It has not yet run on GitHub.
+  It has run on GitHub for the python stack; it does not install ast-grep.
 - `harness check` confirms that each `R<n>` maps to a name that occurs in `src/`, and
   with ast-grep that it really is a test. Whether the test is meaningful stays with the
   reviewer.
