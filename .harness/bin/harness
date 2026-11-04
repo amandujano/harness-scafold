@@ -38,8 +38,12 @@ SPEC_FILES = ("requirements.md", "design.md", "tasks.md")
 MANIFEST = ".harness-init-manifest.json"
 OWNED_MANIFEST = ".harness/manifest.json"
 HARNESS_VERSION = "1.0.0"
-OWNED_FILES = (".harness/bin/harness", ".harness/rules.json", ".harness/AGENTS.md", ".harness/CHECKPOINTS.md")
-OWNED_TREES = (".harness/templates", ".claude/agents", ".claude/skills")
+CHECKPOINTS = ".harness/CHECKPOINTS.md"
+CHECKPOINTS_HEADER = ("<!-- Generated from .harness/rules.json by `harness checkpoints --write`. "
+                      "Do not edit by hand. -->")
+RUNTIME_TEMPLATES = ("progress_current.md",)
+OWNED_FILES = (".harness/bin/harness", ".harness/rules.json", ".harness/AGENTS.md")
+OWNED_TREES = (".claude/agents", ".claude/skills")
 PROJECT_OWNED_DOCS = {"architecture.md", "conventions.md"}
 SETTINGS = ".claude/settings.json"
 WORKFLOW = ".github/workflows/harness.yml"
@@ -63,7 +67,7 @@ GIT_TIMEOUT_SECONDS = 5
 
 # Top-level .harness entries that belong to one project and are never copied.
 GENERATED_NAMES = {"__pycache__", "settings.local.json"}
-NOT_COPIED = {"manifest.json", "tests", "state", "approvals", "specs", "progress", "config.json", "stacks", "__pycache__"}
+NOT_COPIED = {"manifest.json", "tests", "state", "approvals", "specs", "progress", "config.json", "templates", "stacks", "__pycache__"}
 
 
 class HarnessError(Exception):
@@ -210,6 +214,13 @@ def validate_rules(rules):
     for invariant in rules["invariants"]:
         if invariant.get("id") not in INVARIANTS:
             errors.append(f"rules.json: unknown invariant {invariant.get('id')}")
+    # Optional: a project may keep an older rules.json beside a newer CLI, and that must
+    # not turn into a hook that blocks everything.
+    if "checkpoints" in rules:
+        known = {section.get("id") for section in rules["checkpoints"].get("sections", [])}
+        for invariant in rules["invariants"]:
+            if invariant.get("checkpoint") not in known:
+                errors.append(f"rules.json: invariant {invariant.get('id')} names an unknown checkpoint")
     for key in ("statuses", "severities", "kinds", "append_only_roles", "transitions"):
         if key not in rules["debt"]:
             errors.append(f"rules.json: debt missing {key}")
@@ -745,6 +756,32 @@ def inv_resolved_debt_has_evidence(ctx):
     return errors
 
 
+def render_checkpoints(rules):
+    """The text of the checkpoints file: a pure function of rules.json."""
+    if "checkpoints" not in rules:
+        raise HarnessError("rules.json has no checkpoints section")
+    document = rules["checkpoints"]
+    lines = [CHECKPOINTS_HEADER, "", f"# {document['title']}", ""]
+    lines += [f"> {line}".rstrip() for line in document["intro"]]
+    for section in document["sections"]:
+        lines += ["", f"## {section['id']} — {section['title']}", ""]
+        automated = section.get("auto", []) + [i["description"] for i in rules["invariants"]
+                                               if i.get("checkpoint") == section["id"]]
+        lines += [f"- [ ] **[auto]** {item}" for item in automated]
+        lines += [f"- [ ] {item}" for item in section.get("judgment", [])]
+    lines += ["", "---", ""]
+    for index, note in enumerate(document["notes"]):
+        lines += ([""] if index else []) + [note]
+    return "\n".join(lines) + "\n"
+
+
+def inv_checkpoints_current(ctx):
+    path = ctx.root / CHECKPOINTS
+    if path.is_file() and read_text(path) != render_checkpoints(ctx.rules):
+        return [f"{CHECKPOINTS} is stale: a human must run `harness checkpoints --write`"]
+    return []
+
+
 def inv_task_record_valid(ctx):
     path = ctx.root / TASKS
     if not path.exists():
@@ -831,6 +868,7 @@ INVARIANTS = {
     "no_open_critical_debt": inv_no_open_critical_debt,
     "resolved_debt_has_evidence": inv_resolved_debt_has_evidence,
     "task_record_valid": inv_task_record_valid,
+    "checkpoints_current": inv_checkpoints_current,
     "scheduled_debt_promoted": inv_scheduled_debt_promoted,
 }
 
@@ -1023,6 +1061,17 @@ def next_action(ctx, deep=True):
         name, origin = blocked[0]["name"], blocked[0]["blocked_from"]
         return f"human: resolve blocked feature {name}, then run `harness transition {name} {origin} --as human`"
     return "leader: no open work; take new intent from the human and decompose it into features"
+
+
+def cmd_checkpoints(args):
+    root = find_root()
+    text = render_checkpoints(load_rules(root))
+    if args.write:
+        (root / CHECKPOINTS).write_text(text, encoding="utf-8")
+        ok(f"wrote {CHECKPOINTS}")
+    else:
+        sys.stdout.write(text)
+    return 0
 
 
 def cmd_next(args):
@@ -1759,11 +1808,11 @@ def harness_subcommand(argv):
     return None
 
 
-def transition_actor(call):
-    """The actor the CLI itself would see, or None when it would reject the call."""
+def parsed_call(call):
+    """The arguments the CLI itself would see, or None when it would reject the call."""
     try:
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-            return build_parser().parse_args(call).as_actor
+            return build_parser().parse_args(call)
     except SystemExit:
         return None
 
@@ -1784,7 +1833,7 @@ def harness_call_denial(policy, argv):
     name = os.path.basename(argv[0])
     if runs_approve(argv, name):
         return "`harness approve` is human only"
-    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci"} & set(argv[1:]):
+    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci", "checkpoints"} & set(argv[1:]):
         return "the CLI cannot be run through an unresolved variable"
     call = harness_subcommand(argv)
     if not call:
@@ -1792,9 +1841,14 @@ def harness_call_denial(policy, argv):
     if "$" in call[0]:
         return "harness subcommands cannot be hidden in an unresolved variable"
     if call[0] == "transition":
-        actor = transition_actor(call)
+        parsed = parsed_call(call)
+        actor = parsed.as_actor if parsed else None
         if actor != role:
             return f"role {role} cannot run this transition as {actor or 'an unparsable actor'}"
+    if call[0] == "checkpoints":
+        parsed = parsed_call(call)
+        if parsed is None or parsed.write:
+            return "`harness checkpoints --write` is human only"
     allowed = policy.rules["command_roles"].get(call[0])
     if allowed is not None and role not in allowed:
         return f"role {role} may not run `harness {call[0]}`"
@@ -2403,7 +2457,10 @@ def copy_harness(source, target, stack_name, run):
             run.copy_tree(entry, destination)
         else:
             run.copy_file(entry, destination)
-    run.copy_tree(source / HARNESS_DIR / "stacks" / stack_name, target / HARNESS_DIR / "stacks" / stack_name)
+    stack_file = f"stacks/{stack_name}/stack.json"
+    run.copy_file(source / HARNESS_DIR / stack_file, target / HARNESS_DIR / stack_file)
+    for name in RUNTIME_TEMPLATES:
+        run.copy_file(source / HARNESS_DIR / "templates" / name, target / HARNESS_DIR / "templates" / name)
     for folder in ("approvals", "specs", "state", "progress"):
         path = target / HARNESS_DIR / folder
         run.make_dirs(path)
@@ -2565,7 +2622,9 @@ def owned_files(root, stack):
     """Harness-owned paths under root. Everything else belongs to the project."""
     root = Path(root)
     paths = [root / name for name in OWNED_FILES]
-    for tree in OWNED_TREES + (f".harness/stacks/{stack}",):
+    paths.append(root / HARNESS_DIR / "stacks" / stack / "stack.json")
+    paths += [root / HARNESS_DIR / "templates" / name for name in RUNTIME_TEMPLATES]
+    for tree in OWNED_TREES:
         paths += [p for p in (root / tree).rglob("*") if p.is_file() and not set(p.parts) & GENERATED_NAMES]
     paths += [p for p in (root / ".harness/docs").glob("*.md") if p.name not in PROJECT_OWNED_DOCS]
     return sorted(str(p.relative_to(root)) for p in paths if p.is_file())
@@ -2626,6 +2685,18 @@ def dirty_owned_paths(target, paths):
     return result.stdout.splitlines() if result.returncode == 0 else []
 
 
+def checkpoints_after_update(target, plan, force):
+    """The checkpoints text for the rules the project will end up with, if they have any."""
+    kept_local = ".harness/rules.json" in plan.get("conflict", []) and not force
+    rules = load_json((target if kept_local else SOURCE_ROOT) / RULES)
+    return render_checkpoints(rules) if "checkpoints" in rules else None
+
+
+def checkpoints_differ(target, text):
+    path = target / CHECKPOINTS
+    return text is not None and (not path.is_file() or read_text(path) != text)
+
+
 def print_update_plan(plan, settings_change):
     for action, label in (("add", "add"), ("replace", "replace"), ("conflict", "locally modified")):
         for rel in plan.get(action, []):
@@ -2636,9 +2707,10 @@ def print_update_plan(plan, settings_change):
         print("  nothing to update")
 
 
-def apply_update(target, stack, plan, recorded, settings, force):
+def apply_update(target, stack, plan, recorded, settings, checkpoints, force):
     run = InitRun(target)
-    files = dict(recorded)
+    owned = set(owned_files(SOURCE_ROOT, stack))
+    files = {rel: digest for rel, digest in recorded.items() if rel in owned}
     with signals_raise():
         try:
             for rel in plan.get("add", []) + plan.get("replace", []) + (plan.get("conflict", []) if force else []):
@@ -2652,6 +2724,8 @@ def apply_update(target, stack, plan, recorded, settings, force):
                 files[rel] = file_hash(SOURCE_ROOT / rel)
             if settings is not None:
                 run.write(target / SETTINGS, json.dumps(settings, indent=2) + "\n")
+            if checkpoints_differ(target, checkpoints):
+                run.write(target / CHECKPOINTS, checkpoints)
             manifest = {"version": HARNESS_VERSION, "files": files}
             run.write(target / OWNED_MANIFEST, json.dumps(manifest, indent=2) + "\n")
             run.finish()
@@ -2689,15 +2763,21 @@ def cmd_update(args):
     merged = merged_settings(target)
     settings = merged if merged != load_json(target / SETTINGS) else None
     print_update_plan(plan, settings is not None)
+    checkpoints = checkpoints_after_update(target, plan, args.force)
+    if checkpoints_differ(target, checkpoints):
+        print(f"  regenerate: {CHECKPOINTS}")
     if args.dry_run:
         ok("dry run: nothing changed")
         return 0
-    dirty = dirty_owned_paths(target, [rel for rel in owned_files(target, stack)] + [SETTINGS])
+    dirty = dirty_owned_paths(target, owned_files(target, stack) + [SETTINGS, CHECKPOINTS])
     if dirty and not args.force:
         raise HarnessError("harness-owned files have uncommitted changes; commit them or use --force:\n  "
                            + "\n  ".join(dirty[:BRIEFING_LIST_CAP]))
-    apply_update(target, stack, plan, recorded, settings, args.force)
+    apply_update(target, stack, plan, recorded, settings, checkpoints, args.force)
     ok(f"updated to harness {HARNESS_VERSION}")
+    if ".harness/rules.json" in plan.get("conflict", []) and not args.force:
+        warn("your rules.json was kept: merge .harness/rules.json.new by hand, "
+             "then run `harness checkpoints --write`")
     if report_check(target, with_tests=False) != 0:
         fail("updated, but check failed: fix the problems above")
         return EXIT_INIT_CHECK_FAILED
@@ -2773,6 +2853,9 @@ def build_parser():
     check.add_argument("--no-tests", action="store_true")
 
     command("next", cmd_next, "print the one legal next action")
+
+    checkpoints = command("checkpoints", cmd_checkpoints, "print or write the checkpoints file")
+    checkpoints.add_argument("--write", action="store_true")
 
     resume = command("resume", cmd_resume, "print a fast read-only briefing of the current work")
     resume.add_argument("--json", action="store_true")

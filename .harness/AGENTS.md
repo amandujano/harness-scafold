@@ -35,7 +35,7 @@
 | `.harness/docs/specs.md` | SDD process and EARS notation | Before drafting or reading a spec |
 | `.harness/docs/verification.md` | How to prove the work functions | Before closing a task |
 | `.harness/docs/model_strategy.md` | Which model each agent runs on and why | Before changing an agent's `model:` |
-| `.harness/CHECKPOINTS.md` | Criteria for a correct final state | For self-evaluation |
+| `.harness/CHECKPOINTS.md` | Criteria for a correct final state, generated from `.harness/rules.json` | For self-evaluation |
 | `.claude/agents/` | `leader`, `spec_author`, `implementer`, `reviewer` | If orchestrating work |
 
 ## 3. Hard Rules

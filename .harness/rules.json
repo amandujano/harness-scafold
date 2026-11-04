@@ -134,17 +134,98 @@
     ".harness/docs/stack/testing.md"
   ],
   "invariants": [
-    { "id": "hook_wired", "checkpoint": "C1", "description": ".claude/settings.json runs the harness PreToolUse hook" },
-    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature or debt is in_progress" },
-    { "id": "spec_files_present", "checkpoint": "C6", "description": "Every sdd feature past pending has its three spec files" },
-    { "id": "spec_shape_valid", "checkpoint": "C6", "description": "Every sdd feature past pending has R<n> headings and tasks that reference them" },
-    { "id": "approval_valid", "checkpoint": "C6", "description": "Every sdd feature in in_progress or done has an approval matching its current spec" },
-    { "id": "done_tasks_complete", "checkpoint": "C6", "description": "Every done sdd feature has all tasks checked" },
-    { "id": "done_traceability", "checkpoint": "C6", "description": "Every R<n> of a done sdd feature maps to a test name that occurs in the application" },
-    { "id": "done_review_approved", "checkpoint": "C2", "description": "Every done feature has an implementation report and a current APPROVED review" },
-    { "id": "no_open_critical_debt", "checkpoint": "C7", "description": "No critical debt is open" },
-    { "id": "resolved_debt_has_evidence", "checkpoint": "C7", "description": "Every resolved debt has current evidence or the feature that paid it" },
-    { "id": "task_record_valid", "checkpoint": "C2", "description": "The task record, when present, is well formed" },
-    { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every scheduled sdd debt has a matching feature that is not done" }
-  ]
+    { "id": "hook_wired", "checkpoint": "C1", "description": "`.claude/settings.json` runs the harness PreToolUse and SessionStart hooks." },
+    { "id": "single_in_progress", "checkpoint": "C2", "description": "At most one feature or debt is `in_progress`." },
+    { "id": "spec_files_present", "checkpoint": "C6", "description": "Every `sdd: true` feature past `pending` has its 3 spec files." },
+    { "id": "spec_shape_valid", "checkpoint": "C6", "description": "Every `sdd: true` feature past `pending` has `R<n>` headings and tasks that reference them." },
+    { "id": "approval_valid", "checkpoint": "C6", "description": "Every `sdd: true` feature in `in_progress` or `done` has an approval that matches its current spec." },
+    { "id": "done_tasks_complete", "checkpoint": "C6", "description": "Every `done` `sdd: true` feature has all tasks `[x]`." },
+    { "id": "done_traceability", "checkpoint": "C6", "description": "Every `R<n>` of a `done` feature maps to a test name that occurs in `src/`." },
+    { "id": "done_review_approved", "checkpoint": "C2", "description": "Every `done` feature has an implementation report and a current APPROVED review." },
+    { "id": "no_open_critical_debt", "checkpoint": "C7", "description": "No `critical` debt is `open`." },
+    { "id": "resolved_debt_has_evidence", "checkpoint": "C7", "description": "Every `resolved` debt has current evidence or the feature that paid it." },
+    { "id": "task_record_valid", "checkpoint": "C2", "description": "The task record, when present, is well formed." },
+    { "id": "scheduled_debt_promoted", "checkpoint": "C7", "description": "Every `scheduled` debt with `sdd: true` has a feature with the same `name` that is not `done`." },
+    { "id": "checkpoints_current", "checkpoint": "C1", "description": "`.harness/CHECKPOINTS.md` matches `.harness/rules.json`." }
+  ],
+  "checkpoints": {
+    "title": "CHECKPOINTS — Final State Evaluation",
+    "intro": [
+      "In multi-agent systems, the path is not evaluated; the destination is.",
+      "",
+      "**[auto]** items are enforced by `.harness/bin/harness check`: a passing check",
+      "proves them, so do not re-judge them. The remaining items need judgment."
+    ],
+    "sections": [
+      {
+        "id": "C1",
+        "title": "The Harness is Complete",
+        "auto": [
+          "Every file in `required_files` of `.harness/rules.json` exists.",
+          "`.harness/bin/harness check` exits 0."
+        ]
+      },
+      {
+        "id": "C2",
+        "title": "State is Consistent",
+        "auto": [
+          "State files are valid and use only known statuses."
+        ],
+        "judgment": [
+          "`.harness/progress/current.md` is empty or describes the active session."
+        ]
+      },
+      {
+        "id": "C3",
+        "title": "Code Respects Architecture",
+        "judgment": [
+          "`src/` only contains what `.harness/docs/architecture.md` and the specs plan.",
+          "New dependencies are justified in the feature's spec.",
+          "No debug output or contextless TODOs."
+        ]
+      },
+      {
+        "id": "C4",
+        "title": "Verification is Real",
+        "auto": [
+          "`commands.test` is configured and passes.",
+          "When a feature is `done`, the test command finds tests."
+        ],
+        "judgment": [
+          "Tests follow `.harness/docs/stack/testing.md` and assert concrete results."
+        ]
+      },
+      {
+        "id": "C5",
+        "title": "Session Closed Correctly",
+        "judgment": [
+          "No suspicious untracked files.",
+          "`.harness/progress/history.md` has an entry for the last session."
+        ]
+      },
+      {
+        "id": "C6",
+        "title": "Spec Driven Development",
+        "judgment": [
+          "Each mapped test really verifies its `R<n>`.",
+          "`requirements.md` uses strict EARS (see `.harness/docs/specs.md`)."
+        ]
+      },
+      {
+        "id": "C7",
+        "title": "Technical Debt is Declared, Not Hidden",
+        "auto": [
+          "Every debt has verifiable fields: non-empty `acceptance`, and an `origin` naming agent, feature and session."
+        ],
+        "judgment": [
+          "Every `acceptance` item is genuinely verifiable.",
+          "Every shortcut visible in the session's diff has a matching entry. A clean ledger next to a diff full of compromises is a **failing** checkpoint."
+        ]
+      }
+    ],
+    "notes": [
+      "**How to use this file:** the reviewer goes through the items that need judgment and rejects the work if any fails.",
+      "> **On C7:** an empty debt ledger is only credible when the diff is genuinely clean. A reviewer that never finds debt is either reviewing perfect work or not reviewing at all."
+    ]
+  }
 }

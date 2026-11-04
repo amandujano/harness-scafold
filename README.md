@@ -78,7 +78,9 @@ can tell them from your edits. `.github/workflows/harness.yml` exists only after
 run `harness ci github`.
 
 `.claude/` stays outside `.harness/` because Claude Code loads agents and settings
-from fixed locations. Stack commands run from `src/`, so frameworks keep their usual
+from fixed locations. A generated `.harness/` is slim: from `stacks/` it keeps only its
+`stack.json`, the guides live in `.harness/docs/stack/`, and from `templates/` it keeps
+only the session template. Stack commands run from `src/`, so frameworks keep their usual
 layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Maven.
 
 ## Daily Flow
@@ -104,6 +106,7 @@ layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Ma
 | `harness task start <feature> T<n>` | Implementer: record that a task has started |
 | `harness debt start <name>` | Leader: start paying an `sdd: false` debt in place |
 | `harness debt resolve <name>` | Leader: close a paid debt on its evidence |
+| `harness checkpoints [--write]` | Print `.harness/CHECKPOINTS.md`, or regenerate it (human only) |
 | `harness update [--dry-run] [--force]` | Update harness-owned files from the scaffold |
 | `harness ci github [--force]` | Write the GitHub Actions workflow |
 | `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
@@ -148,8 +151,11 @@ replaced. A locally modified file is kept, and the incoming version lands beside
 entries in `.claude/settings.json` are merged, and your other settings stay. A failure
 rolls everything back.
 
-It updates the CLI, `rules.json`, templates, the project's stack, generic docs, agents
-and skills. It never touches `.harness/state/`, `specs/`, `progress/`, `approvals/`,
+It updates the CLI, `rules.json`, the session template, the project's `stack.json`,
+generic docs, agents and skills, and regenerates `.harness/CHECKPOINTS.md` from the
+resulting rules. If it keeps your `rules.json`, merge `rules.json.new` by hand and run
+`harness checkpoints --write`. Files an older project has beyond this are left alone.
+It never touches `.harness/state/`, `specs/`, `progress/`, `approvals/`,
 `config.json`, `src/`, `.claude/CLAUDE.md`, `.harness/docs/stack/`, `architecture.md` or
 `conventions.md`. Only you run it: the hook blocks agents.
 

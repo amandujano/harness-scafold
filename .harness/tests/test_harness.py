@@ -1930,6 +1930,91 @@ class UpdateTests(UpdateCiCase):
         self.assertIn(mine, entries)
         self.assertEqual(sum("harness" in h["command"] for h in entries), 1)
 
+    def test_rules_update_regenerates_checkpoints(self):
+        rules_path = self.source / RULES
+        rules = json.loads(rules_path.read_text())
+        rules["checkpoints"]["sections"][0]["judgment"] = ["A brand new item."]
+        rules_path.write_text(json.dumps(rules, indent=2))
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("A brand new item.", (self.root / ".harness/CHECKPOINTS.md").read_text())
+        self.assertEqual(self.run_cli("check", "--no-tests").returncode, 0)
+
+    def test_dry_run_reports_the_regeneration_and_changes_nothing(self):
+        rules_path = self.source / RULES
+        rules = json.loads(rules_path.read_text())
+        rules["checkpoints"]["sections"][0]["judgment"] = ["A brand new item."]
+        rules_path.write_text(json.dumps(rules, indent=2))
+        before = (self.root / ".harness/CHECKPOINTS.md").read_bytes()
+        self.assertIn("regenerate: .harness/CHECKPOINTS.md", self.run_cli("update", "--dry-run").stdout)
+        self.assertEqual((self.root / ".harness/CHECKPOINTS.md").read_bytes(), before)
+
+    def test_kept_local_rules_stay_consistent_and_say_what_to_run(self):
+        incoming = self.source / RULES
+        rules = json.loads(incoming.read_text())
+        rules["checkpoints"]["sections"][0]["judgment"] = ["Incoming item."]
+        incoming.write_text(json.dumps(rules, indent=2))
+        local = self.root / RULES
+        mine = json.loads(local.read_text())
+        mine["checkpoints"]["sections"][1]["judgment"].append("My item.")
+        local.write_text(json.dumps(mine, indent=2))
+        self.commit()
+        result = self.run_cli("update")
+        self.assertIn("harness checkpoints --write", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = (self.root / ".harness/CHECKPOINTS.md").read_text()
+        self.assertIn("My item.", text)
+        self.assertNotIn("Incoming item.", text)
+        self.assertTrue((self.root / ".harness/rules.json.new").is_file())
+
+    def test_kept_rules_without_checkpoints_do_not_break_the_update(self):
+        self.change_source(".harness/AGENTS.md")
+        local = self.root / RULES
+        rules = json.loads(local.read_text())
+        del rules["checkpoints"]
+        rules["invariants"] = [i for i in rules["invariants"] if i["id"] != "checkpoints_current"]
+        local.write_text(json.dumps(rules, indent=2))
+        before = (self.root / ".harness/CHECKPOINTS.md").read_bytes()
+        self.commit()
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / ".harness/CHECKPOINTS.md").read_bytes(), before)
+
+    def test_generated_project_is_slim(self):
+        self.assertEqual(sorted(str(p.relative_to(self.root)) for p in (self.root / ".harness/stacks").rglob("*")
+                                if p.is_file()), [".harness/stacks/python/stack.json"])
+        self.assertEqual([p.name for p in (self.root / ".harness/templates").iterdir()], ["progress_current.md"])
+        self.assertTrue((self.root / ".harness/docs/stack/testing.md").is_file())
+
+    def test_older_project_keeps_its_extra_files_untouched(self):
+        extras = [".harness/templates/config.json", ".harness/stacks/python/conventions.md",
+                  ".harness/stacks/python/scaffold/app/__init__.py"]
+        manifest_path = self.root / ".harness/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        for rel in extras:
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("old\n")
+            manifest["files"][rel] = hashlib.sha256(b"old\n").hexdigest()
+        manifest["files"][".harness/CHECKPOINTS.md"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        self.commit()
+        self.change_source()
+        self.change_source(".harness/stacks/python/conventions.md")
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for rel in extras:
+            self.assertEqual((self.root / rel).read_text(), "old\n")
+            self.assertFalse((self.root / f"{rel}.new").exists())
+        recorded = json.loads(manifest_path.read_text())["files"]
+        self.assertFalse(set(extras) & set(recorded))
+        self.assertNotIn(".harness/CHECKPOINTS.md", recorded)
+
+    def test_older_project_missing_nothing_does_not_recreate_removed_extras(self):
+        self.change_source(".harness/templates/config.json")
+        self.assertEqual(self.run_cli("update").returncode, 0)
+        self.assertFalse((self.root / ".harness/templates/config.json").exists())
+
     def test_failure_rolls_everything_back(self):
         first = self.change_source()
         self.change_source(".harness/docs/specs.md")
@@ -2031,6 +2116,72 @@ class UpdateCiHookTests(HookCase):
 
     def test_agents_may_not_write_the_owned_manifest(self):
         self.assert_blocked(self.write_call(".harness/manifest.json", "leader"))
+
+
+class CheckpointTests(HookCase):
+    FILE = ".harness/CHECKPOINTS.md"
+
+    def test_shipped_file_is_current_and_generated(self):
+        result = subprocess.run([sys.executable, str(CLI), "checkpoints"], cwd=str(SOURCE),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, (SOURCE / self.FILE).read_text())
+        self.assertIn("Do not edit by hand", result.stdout)
+
+    def test_every_invariant_and_section_is_rendered(self):
+        text = self.run_cli("checkpoints").stdout
+        rules = self.read_json(RULES)
+        for invariant in rules["invariants"]:
+            self.assertIn(invariant["description"], text)
+        for section in rules["checkpoints"]["sections"]:
+            self.assertIn(f"## {section['id']} — {section['title']}", text)
+        self.assertIn("PreToolUse and SessionStart", text)
+        self.assertIn("**How to use this file:**", text)
+        self.assertIn("**On C7:**", text)
+
+    def test_intro_is_one_clean_quote_block(self):
+        text = self.run_cli("checkpoints").stdout
+        self.assertNotIn("> >", text)
+        self.assertIn("the destination is.\n>\n> **[auto]**", text)
+
+    def test_rendering_is_deterministic(self):
+        self.assertEqual(self.run_cli("checkpoints").stdout, self.run_cli("checkpoints").stdout)
+
+    def test_hand_edit_fails_check_with_the_fix(self):
+        self.path(self.FILE).write_text(self.path(self.FILE).read_text() + "edit\n")
+        self.assert_check_fails("harness checkpoints --write")
+
+    def test_rules_change_makes_the_file_stale_and_write_fixes_it(self):
+        rules = self.read_json(RULES)
+        rules["checkpoints"]["sections"][0]["judgment"] = ["A new item."]
+        self.write(RULES, json.dumps(rules))
+        self.assert_check_fails("is stale")
+        self.assertEqual(self.run_cli("checkpoints", "--write").returncode, 0)
+        self.assert_check_passes()
+
+    def test_invariant_naming_an_unknown_checkpoint_is_invalid(self):
+        rules = self.read_json(RULES)
+        rules["invariants"][0]["checkpoint"] = "C99"
+        self.write(RULES, json.dumps(rules))
+        self.assert_check_fails("unknown checkpoint")
+
+    def test_older_rules_without_checkpoints_do_not_block_the_hook(self):
+        rules = self.read_json(RULES)
+        del rules["checkpoints"]
+        rules["invariants"] = [i for i in rules["invariants"] if i["id"] != "checkpoints_current"]
+        self.write(RULES, json.dumps(rules))
+        self.assert_allowed(self.write_call("src/app/x.py", "implementer"))
+        self.assert_check_passes()
+
+    def test_write_is_human_only_and_printing_is_not(self):
+        for agent in (None, "leader", "implementer", "reviewer", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.bash("harness checkpoints --write", agent))
+                self.assert_blocked(self.bash(".harness/bin/harness checkpoints --wr", agent))
+                self.assert_blocked(self.write_call(self.FILE, agent))
+                self.assert_blocked(self.bash(f"echo x > {self.FILE}", agent))
+        self.assert_blocked(self.bash("$H checkpoints --write", "leader"))
+        self.assert_allowed(self.bash("harness checkpoints", "reviewer"))
 
 
 class LifecycleRegressionTests(ProjectCase):

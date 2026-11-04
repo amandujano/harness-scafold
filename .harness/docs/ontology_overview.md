@@ -111,6 +111,9 @@ goes back to the reviewer.
 - **Two next paths.** `next` runs slow guards and tests so it cannot offer a step that
   would be refused. `resume` must stay fast, so it stops at state and says when `next`
   may route elsewhere.
+- **Checkpoints are generated.** `.harness/CHECKPOINTS.md` is rendered from the
+  `checkpoints` and `invariants` sections of `.harness/rules.json`, and `harness check`
+  fails if the file is stale, so the rule and its prose cannot drift apart.
 - **Scaffold mode.** With `"stack": null` the hook is passive, so the harness itself
   can be developed. `.harness/config.json` is not writable by agents in a project.
 
@@ -133,10 +136,6 @@ goes back to the reviewer.
   It has not yet run on GitHub.
 - `harness check` confirms that each `R<n>` maps to a name that occurs in `src/`, not
   that the test is meaningful. That judgment stays with the reviewer.
-
-## 6. Open Questions
-
-- Should `.harness/CHECKPOINTS.md` be generated from `invariants`, or stay hand-written?
 
 ## History: How the Design Was Chosen
 
