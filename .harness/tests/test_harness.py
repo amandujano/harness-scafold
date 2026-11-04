@@ -1,5 +1,6 @@
 import base64
 import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -1793,6 +1794,243 @@ class SessionStartTests(ProjectCase):
         del settings["hooks"]["PreToolUse"]
         self.write(".claude/settings.json", json.dumps(settings))
         self.assert_check_fails("does not run the harness PreToolUse hook")
+
+
+class UpdateCiCase(unittest.TestCase):
+    """A project generated from a private scaffold copy, so the scaffold can change."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="harness-update-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.source = self.tmp / "source"
+        self.source.mkdir()
+        shutil.copytree(SOURCE / ".harness", self.source / ".harness", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(SOURCE / ".claude", self.source / ".claude")
+        shutil.copy2(SOURCE / ".gitignore", self.source / ".gitignore")
+        self.cli = self.source / ".harness/bin/harness"
+        self.root = self.tmp / "app"
+        result = self.run_cli("init", "python", str(self.root), cwd=self.tmp)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.commit()
+
+    def run_cli(self, *args, cwd=None, cli=None):
+        return subprocess.run([sys.executable, str(cli or self.cli), *args], cwd=str(cwd or self.root),
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+    def commit(self):
+        for command in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *command], cwd=str(self.root), check=True)
+
+    def change_source(self, rel=".claude/agents/leader.md"):
+        path = self.source / rel
+        path.write_text(path.read_text() + "\nincoming\n")
+        return rel
+
+    def project_bytes(self, *folders):
+        return {p: p.read_bytes() for folder in folders for p in (self.root / folder).rglob("*") if p.is_file()}
+
+
+class UpdateTests(UpdateCiCase):
+    def test_init_writes_a_manifest_of_owned_files(self):
+        manifest = json.loads((self.root / ".harness/manifest.json").read_text())
+        self.assertTrue(manifest["version"])
+        self.assertIn(".harness/bin/harness", manifest["files"])
+        self.assertIn(".claude/agents/leader.md", manifest["files"])
+        self.assertNotIn(".harness/docs/architecture.md", manifest["files"])
+        self.assertFalse(any("state/" in rel or "go/" in rel for rel in manifest["files"]))
+
+    def test_unchanged_file_is_replaced_and_project_files_are_not(self):
+        rel = self.change_source()
+        self.change_source(".harness/docs/architecture.md")
+        self.change_source(".harness/templates/feature_list.json")
+        (self.source / ".harness/state/feature_list.json").write_text("{}")
+        before = self.project_bytes(".harness/state", ".harness/specs", ".harness/progress",
+                                    ".harness/approvals", "src")
+        config = (self.root / CONFIG).read_bytes()
+        architecture = (self.root / ".harness/docs/architecture.md").read_bytes()
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("incoming", (self.root / rel).read_text())
+        self.assertEqual(self.project_bytes(".harness/state", ".harness/specs", ".harness/progress",
+                                            ".harness/approvals", "src"), before)
+        self.assertEqual((self.root / CONFIG).read_bytes(), config)
+        self.assertEqual((self.root / ".harness/docs/architecture.md").read_bytes(), architecture)
+        recorded = json.loads((self.root / ".harness/manifest.json").read_text())["files"]
+        self.assertEqual(recorded[rel], hashlib.sha256((self.root / rel).read_bytes()).hexdigest())
+
+    def test_local_change_is_kept_with_a_new_file_and_a_warning(self):
+        rel = self.change_source()
+        (self.root / rel).write_text("mine\n")
+        self.commit()
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / rel).read_text(), "mine\n")
+        self.assertIn("incoming", (self.root / f"{rel}.new").read_text())
+        self.assertIn("[WARN]", result.stdout)
+
+    def test_force_overwrites_a_local_change(self):
+        rel = self.change_source()
+        (self.root / rel).write_text("mine\n")
+        self.commit()
+        self.assertEqual(self.run_cli("update", "--force").returncode, 0)
+        self.assertIn("incoming", (self.root / rel).read_text())
+        self.assertFalse((self.root / f"{rel}.new").exists())
+
+    def test_force_never_reaches_project_owned_paths(self):
+        self.change_source(".harness/docs/conventions.md")
+        (self.source / ".harness/config.json").write_text('{"project": "x", "stack": null, "app_dir": "src", '
+                                                          '"commands": {"test": ""}}')
+        before = (self.root / ".harness/docs/conventions.md").read_bytes(), (self.root / CONFIG).read_bytes()
+        self.assertEqual(self.run_cli("update", "--force").returncode, 0)
+        self.assertEqual(((self.root / ".harness/docs/conventions.md").read_bytes(),
+                          (self.root / CONFIG).read_bytes()), before)
+
+    def test_without_a_manifest_every_difference_is_a_local_change(self):
+        rel = self.change_source()
+        (self.root / ".harness/manifest.json").unlink()
+        self.commit()
+        before = (self.root / rel).read_bytes()
+        self.assertEqual(self.run_cli("update").returncode, 0)
+        self.assertEqual((self.root / rel).read_bytes(), before)
+        self.assertTrue((self.root / f"{rel}.new").exists())
+
+    def test_dry_run_changes_nothing(self):
+        rel = self.change_source()
+        before = self.project_bytes(".harness", ".claude")
+        result = self.run_cli("update", "--dry-run")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(rel, result.stdout)
+        self.assertEqual(self.project_bytes(".harness", ".claude"), before)
+
+    def test_uncommitted_harness_files_stop_the_update(self):
+        rel = self.change_source()
+        (self.root / rel).write_text("uncommitted\n")
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncommitted", result.stderr)
+        self.assertFalse((self.root / f"{rel}.new").exists())
+        self.assertEqual(self.run_cli("update", "--force").returncode, 0)
+
+    def test_settings_merge_keeps_user_settings_and_hooks(self):
+        path = self.root / ".claude/settings.json"
+        settings = json.loads(path.read_text())
+        del settings["hooks"]["SessionStart"]
+        settings["model"] = "sonnet"
+        mine = {"type": "command", "command": "my-linter"}
+        settings["hooks"]["PreToolUse"].append({"matcher": "Write", "hooks": [mine]})
+        settings["hooks"]["Stop"] = [{"hooks": [mine]}]
+        path.write_text(json.dumps(settings))
+        self.commit()
+        self.assertEqual(self.run_cli("update").returncode, 0)
+        merged = json.loads(path.read_text())
+        self.assertEqual(merged["model"], "sonnet")
+        self.assertEqual(merged["hooks"]["Stop"], [{"hooks": [mine]}])
+        self.assertIn("SessionStart", merged["hooks"])
+        entries = [h for group in merged["hooks"]["PreToolUse"] for h in group["hooks"]]
+        self.assertIn(mine, entries)
+        self.assertEqual(sum("harness" in h["command"] for h in entries), 1)
+
+    def test_failure_rolls_everything_back(self):
+        first = self.change_source()
+        self.change_source(".harness/docs/specs.md")
+        before = self.project_bytes(".harness", ".claude")
+        stuck = self.root / ".harness/docs/specs.md"
+        stuck.chmod(0o444)
+        self.addCleanup(stuck.chmod, 0o644)
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.project_bytes(".harness", ".claude"), before)
+        self.assertFalse((self.root / ".harness-init-manifest.json").exists())
+        self.assertNotIn("incoming", (self.root / first).read_text())
+
+    def test_refuses_the_scaffold_and_the_projects_own_copy(self):
+        self.assertIn("scaffold", self.run_cli("update", cwd=self.source).stderr)
+        result = self.run_cli("update", cli=self.root / ".harness/bin/harness")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("global", result.stderr)
+
+
+class CiTests(UpdateCiCase):
+    def parsed(self, text):
+        ruby = shutil.which("ruby")
+        if not ruby:
+            self.skipTest("no YAML parser available")
+        script = "require 'yaml'; require 'json'; puts JSON.generate(YAML.safe_load(STDIN.read, aliases: false))"
+        result = subprocess.run([ruby, "-e", script], input=text, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def workflow(self):
+        return (self.root / ".github/workflows/harness.yml").read_text()
+
+    def test_every_shipped_stack_renders_valid_yaml(self):
+        for path in sorted((SOURCE / ".harness/stacks").glob("*/stack.json")):
+            with self.subTest(stack=path.parent.name):
+                (self.root / ".harness/stacks/python/stack.json").write_text(path.read_text())
+                self.assertEqual(self.run_cli("ci", "github", "--force").returncode, 0)
+                data = self.parsed(self.workflow())
+                # YAML 1.1 parsers read the `on` key as true; GitHub reads it as `on`.
+                self.assertEqual(sorted(data["true"]), ["pull_request", "push"])
+                self.assertEqual(data["name"], "harness")
+                steps = data["jobs"]["check"]["steps"]
+                self.assertEqual(steps[0]["uses"], "actions/checkout@v7")
+                self.assertEqual(steps[-1]["run"], ".harness/bin/harness check")
+
+    def test_runs_on_push_and_pull_request(self):
+        self.run_cli("ci", "github")
+        self.assertIn("  push:\n  pull_request:\n", self.workflow())
+
+    def test_stack_setup_comes_from_stack_json(self):
+        path = self.root / ".harness/stacks/python/stack.json"
+        stack = json.loads(path.read_text())
+        stack["ci"] = {"steps": [{"run": "make toolchain", "working-directory": "src"}]}
+        path.write_text(json.dumps(stack))
+        self.run_cli("ci", "github")
+        steps = self.parsed(self.workflow())["jobs"]["check"]["steps"]
+        self.assertEqual(steps[-2], {"run": "make toolchain", "working-directory": "src"})
+
+    def test_stack_without_setup_says_what_to_add(self):
+        path = self.root / ".harness/stacks/python/stack.json"
+        stack = json.loads(path.read_text())
+        del stack["ci"]
+        path.write_text(json.dumps(stack))
+        result = self.run_cli("ci", "github")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("add your toolchain steps", result.stdout)
+
+    def test_refuses_to_overwrite_without_force(self):
+        target = self.root / ".github/workflows/harness.yml"
+        target.parent.mkdir(parents=True)
+        target.write_text("mine")
+        result = self.run_cli("ci", "github")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(target.read_text(), "mine")
+        self.assertEqual(self.run_cli("ci", "github", "--force").returncode, 0)
+        self.assertNotEqual(target.read_text(), "mine")
+
+    def test_refuses_the_scaffold(self):
+        self.assertEqual(self.run_cli("ci", "github", cwd=self.source).returncode, 1)
+
+
+class UpdateCiHookTests(HookCase):
+    def test_agents_may_not_run_update_or_ci(self):
+        for agent in (None, "leader", "implementer", "reviewer", "general-purpose"):
+            for command in ("harness update", "harness update --force", "harness ci github",
+                            ".harness/bin/harness update --dry-run"):
+                with self.subTest(agent=agent, command=command):
+                    self.assert_blocked(self.bash(command, agent))
+        self.assert_blocked(self.bash("$H update", "leader"))
+
+    def test_agents_may_not_write_workflows(self):
+        for agent in ("leader", "implementer", "reviewer", "general-purpose"):
+            with self.subTest(agent=agent):
+                self.assert_blocked(self.write_call(".github/workflows/harness.yml", agent))
+                self.assert_blocked(self.bash("echo x > .github/workflows/harness.yml", agent))
+                self.assert_blocked(self.bash("echo x > $UNKNOWN/.github/workflows/x.yml", agent))
+
+    def test_agents_may_not_write_the_owned_manifest(self):
+        self.assert_blocked(self.write_call(".harness/manifest.json", "leader"))
 
 
 class LifecycleRegressionTests(ProjectCase):

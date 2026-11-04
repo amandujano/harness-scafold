@@ -73,6 +73,10 @@ delete them.
 src/         The whole application: manifest, code and tests
 ```
 
+`.harness/manifest.json` records the harness files as installed, so `harness update`
+can tell them from your edits. `.github/workflows/harness.yml` exists only after you
+run `harness ci github`.
+
 `.claude/` stays outside `.harness/` because Claude Code loads agents and settings
 from fixed locations. Stack commands run from `src/`, so frameworks keep their usual
 layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Maven.
@@ -100,6 +104,8 @@ layout one level down, such as `src/src/main.ts` in Nest and `src/pom.xml` in Ma
 | `harness task start <feature> T<n>` | Implementer: record that a task has started |
 | `harness debt start <name>` | Leader: start paying an `sdd: false` debt in place |
 | `harness debt resolve <name>` | Leader: close a paid debt on its evidence |
+| `harness update [--dry-run] [--force]` | Update harness-owned files from the scaffold |
+| `harness ci github [--force]` | Write the GitHub Actions workflow |
 | `harness transition <feature> <state>` | Change a status, enforcing actor and guards |
 | `harness approve <feature>` | Human approval: type the code shown on your terminal. Later spec edits invalidate it |
 
@@ -126,19 +132,61 @@ finished)`. The leader asks you whether to resume or to block.
 - The briefing skips tests and slow guards, so it says when `harness next` may differ.
 - Tasks exist only for `sdd: true` features, so other work has no in-flight trace.
 
+## Update a Project
+
+Run the global `harness` from inside a project; it uses its own scaffold clone as the
+source. Commit first: it refuses to start over uncommitted harness files.
+
+```bash
+harness update --dry-run         # print the plan and change nothing
+harness update                   # add `--force` to overwrite local changes
+```
+
+`.harness/manifest.json` records what the last install wrote. An unchanged file is
+replaced. A locally modified file is kept, and the incoming version lands beside it as
+`<file>.new`. Without a manifest, every differing file counts as locally modified. Hook
+entries in `.claude/settings.json` are merged, and your other settings stay. A failure
+rolls everything back.
+
+It updates the CLI, `rules.json`, templates, the project's stack, generic docs, agents
+and skills. It never touches `.harness/state/`, `specs/`, `progress/`, `approvals/`,
+`config.json`, `src/`, `.claude/CLAUDE.md`, `.harness/docs/stack/`, `architecture.md` or
+`conventions.md`. Only you run it: the hook blocks agents.
+
+## Continuous Integration
+
+```bash
+harness ci github                # writes .github/workflows/harness.yml
+```
+
+The workflow runs on push and pull request, sets up the stack's toolchain, and runs
+`harness check`. Each stack declares its setup under `ci` in `stack.json`. `generic`
+declares none, so it tells you what to add. An existing workflow needs `--force`.
+
+CI matters because the hook only governs Claude Code. CI is what audits approvals and
+catches changes made outside it. Review changes to `.harness/approvals/` in pull
+requests. Agents may not write `.github/workflows/`.
+
 ## How Rules Are Enforced
 
 `.harness/rules.json` is the single source of truth for states, transitions, role
 permissions and invariants. If prose disagrees with it, it wins.
 
 `.claude/settings.json` runs `harness hook pre-tool-use` before Write, Edit,
-MultiEdit, NotebookEdit and Bash. The main conversation counts as `leader`. Paths are
+MultiEdit, NotebookEdit and Bash, and `harness hook session-start` when a session
+opens. The main conversation counts as `leader`. Paths are
 compared case-insensitively. Agent types outside the four roles may write only what
 `unknown_role_allow` lists, which excludes `src/`, `.harness/` and `.claude/`.
 
 Evidence has one owner: only `reviewer` writes `.harness/progress/review_*`, and only
 `implementer` writes `.harness/progress/impl_*`. A feature's `name` and `sdd` are
 immutable for agents; a human edits them directly.
+
+The debt ledger keeps every entry: no agent may remove one or mark it `resolved` by
+hand. Only a human may lower, accept or drop a `critical` debt.
+
+`harness approve`, `harness update` and `harness ci github` are for humans, and the
+hook blocks agents from running them. Agents also cannot write `.github/workflows/`.
 
 Global agents, such as `sdd-*`, are outside the four roles, so they are **read-only**
 inside generated projects. Use the project's own agents there.
@@ -162,6 +210,8 @@ Limits you should know:
 - The hook governs Claude Code only. Your editor and terminal are not restricted.
 - `harness check` confirms each requirement maps to a name that occurs in `src/`.
   Judging that the test is meaningful stays with the reviewer.
+- The generated workflow has not yet run on GitHub, and recovery from an update killed
+  midway is untested. Use `harness update --dry-run` first on an important project.
 
 ## Add a Stack
 
@@ -169,7 +219,7 @@ Create `.harness/stacks/<name>/` with these files. No CLI change is needed.
 
 | File | Content |
 |---|---|
-| `stack.json` | `description`, `requires`, `scaffold`, `commands`, `no_tests`, `generated`, `gitignore` |
+| `stack.json` | `description`, `requires`, `scaffold`, `commands`, `no_tests`, `generated`, `gitignore`, `ci` |
 | `conventions.md` | Language and framework rules for agents |
 | `testing.md` | Test location, naming and how to run one test |
 | `scaffold/` | Optional files copied into `src/`; `{{name}}` is replaced |

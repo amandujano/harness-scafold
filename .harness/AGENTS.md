@@ -20,6 +20,7 @@
 | Path | Content | When to read |
 |---|---|---|
 | `src/` | The whole application: manifest, code and tests | To implement |
+| `.harness/manifest.json` | Hashes of harness files as installed, used by `harness update` | Never by hand |
 | `.harness/config.json` | Stack and test, build and lint commands, run from `src/` | Before running commands |
 | `.harness/rules.json` | States, transitions, role permissions, invariants | When a rule is unclear |
 | `.harness/state/feature_list.json` | Features and their status | Always |
@@ -42,10 +43,12 @@
 - **One feature at a time.** Do not mix changes from several features.
 - **Status changes only through `harness transition`.** Never edit it by hand.
 - **Spec approval is human.** Only a person runs `harness approve`.
+- **Project maintenance is human.** Only a person runs `harness update` and
+  `harness ci github`.
 - **Do not close a feature without green tests.** The `done` transition enforces it.
 - **Document what you do** in `.harness/progress/current.md` while working.
 - **Declare every shortcut** in `.harness/state/techdebt_list.json` the moment you
-  take it. An undeclared shortcut is a rejection.
+  take it. An undeclared shortcut is a rejection. Never remove a debt entry.
 - **If you don't know something, look in `.harness/docs/`** before inventing it.
 
 ## 4. Workflow

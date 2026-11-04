@@ -35,5 +35,8 @@
     "dist",
     ".venv",
     ".coverage"
-  ]
+  ],
+  "ci": {
+    "steps": []
+  }
 }

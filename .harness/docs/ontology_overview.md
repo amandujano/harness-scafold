@@ -60,7 +60,8 @@ flowchart TB
 `.harness/bin/harness` is the only code. `check` validates state and runs tests, `next`
 prints one action, `transition` and `debt` change a status under their guards,
 `approve` records a human decision, `task start` traces progress, and `resume` prints a
-state-only briefing. `hook pre-tool-use` runs before Write, Edit, MultiEdit, NotebookEdit
+state-only briefing. `update` and `ci github` maintain a project and are for humans.
+`hook pre-tool-use` runs before Write, Edit, MultiEdit, NotebookEdit
 and Bash, and `hook session-start` injects the briefing, both through
 `.claude/settings.json`.
 
@@ -100,6 +101,13 @@ goes back to the reviewer.
 - **Paying debt in place.** `harness debt` reuses the feature evidence function, so
   rejection loops, staleness and evidence hashes behave the same. An `sdd: false` debt
   counts against the single-active rule, and its `acceptance` is frozen while it is paid.
+- **The ledger keeps every entry.** No agent removes a debt or wipes the file, because
+  a critical debt that vanished would stop blocking closure. Only a human may lower,
+  accept or drop critical debt; the leader triages the rest.
+- **Updates respect local edits.** `.harness/manifest.json` holds the hash of each
+  harness file as installed. `harness update` replaces unchanged files and writes
+  `<file>.new` beside edited ones. It never touches state, specs, reports, approvals,
+  `config.json` or `src/`.
 - **Two next paths.** `next` runs slow guards and tests so it cannot offer a step that
   would be refused. `resume` must stay fast, so it stops at state and says when `next`
   may route elsewhere.
@@ -120,6 +128,9 @@ goes back to the reviewer.
   stopped: this guards against accidental and routine agent behaviour, not a determined
   adversary. Audit `.harness/approvals/` in code review or CI.
 - Script bodies run by an interpreter are not inspected, only the command line.
+- The hook governs Claude Code only. `harness ci github` adds a workflow that runs
+  `harness check` on every push, which also covers changes made outside Claude Code.
+  It has not yet run on GitHub.
 - `harness check` confirms that each `R<n>` maps to a name that occurs in `src/`, not
   that the test is meaningful. That judgment stays with the reviewer.
 

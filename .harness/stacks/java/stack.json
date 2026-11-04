@@ -47,5 +47,16 @@
   ],
   "generated": [
     "target"
-  ]
+  ],
+  "ci": {
+    "steps": [
+      {
+        "uses": "actions/setup-java@v6",
+        "with": {
+          "distribution": "temurin",
+          "java-version": "21"
+        }
+      }
+    ]
+  }
 }

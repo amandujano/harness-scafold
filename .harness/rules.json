@@ -76,7 +76,7 @@
       "allow": [".harness/progress/review_*"]
     }
   },
-  "protected": ["src/**", ".harness/**", ".claude/**", ".git/**"],
+  "protected": ["src/**", ".harness/**", ".claude/**", ".git/**", ".github/workflows/**"],
   "unknown_role_allow": ["*.txt", "tmp/**"],
   "debt": {
     "statuses": ["open", "accepted", "scheduled", "in_progress", "resolved", "wontfix"],
@@ -109,7 +109,9 @@
   },
   "command_roles": {
     "debt": ["leader"],
-    "task": ["implementer"]
+    "task": ["implementer"],
+    "update": [],
+    "ci": []
   },
   "required_files": [
     ".claude/CLAUDE.md",

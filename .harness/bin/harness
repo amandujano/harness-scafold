@@ -36,6 +36,13 @@ DEBTS = ".harness/state/techdebt_list.json"
 TASKS = ".harness/state/tasks.json"
 SPEC_FILES = ("requirements.md", "design.md", "tasks.md")
 MANIFEST = ".harness-init-manifest.json"
+OWNED_MANIFEST = ".harness/manifest.json"
+HARNESS_VERSION = "1.0.0"
+OWNED_FILES = (".harness/bin/harness", ".harness/rules.json", ".harness/AGENTS.md", ".harness/CHECKPOINTS.md")
+OWNED_TREES = (".harness/templates", ".claude/agents", ".claude/skills")
+PROJECT_OWNED_DOCS = {"architecture.md", "conventions.md"}
+SETTINGS = ".claude/settings.json"
+WORKFLOW = ".github/workflows/harness.yml"
 RESERVED_DIRS = {".harness", ".claude", ".git"}
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TASK_LINE = re.compile(r"^\s*[-*]\s*\[( |x|X)\]", re.MULTILINE)
@@ -56,7 +63,7 @@ GIT_TIMEOUT_SECONDS = 5
 
 # Top-level .harness entries that belong to one project and are never copied.
 GENERATED_NAMES = {"__pycache__", "settings.local.json"}
-NOT_COPIED = {"tests", "state", "approvals", "specs", "progress", "config.json", "stacks", "__pycache__"}
+NOT_COPIED = {"manifest.json", "tests", "state", "approvals", "specs", "progress", "config.json", "stacks", "__pycache__"}
 
 
 class HarnessError(Exception):
@@ -1777,7 +1784,7 @@ def harness_call_denial(policy, argv):
     name = os.path.basename(argv[0])
     if runs_approve(argv, name):
         return "`harness approve` is human only"
-    if argv[0].startswith("$") and {"transition", "debt", "task"} & set(argv[1:]):
+    if argv[0].startswith("$") and {"transition", "debt", "task", "update", "ci"} & set(argv[1:]):
         return "the CLI cannot be run through an unresolved variable"
     call = harness_subcommand(argv)
     if not call:
@@ -2171,18 +2178,31 @@ def preflight(stack_name, stack, target):
                 raise HarnessError(f"{path} already exists; refusing to overwrite it")
 
 
-def undo_entries(entries):
-    for entry in reversed(entries):
-        path, kind = Path(entry["path"]), entry["kind"]
-        if kind == "saved":
+def undo_entry(entry):
+    path, kind = Path(entry["path"]), entry["kind"]
+    if kind == "saved":
+        data = base64.b64decode(entry["data"])
+        if not path.is_file() or path.read_bytes() != data:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(base64.b64decode(entry["data"]))
-        elif kind == "tree" and path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path, ignore_errors=True)
-        elif kind in ("file", "tree") and (path.exists() or path.is_symlink()):
-            path.unlink()
-        elif kind == "dir":
-            remove_if_empty(path)
+            path.write_bytes(data)
+    elif kind == "tree" and path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    elif kind in ("file", "tree") and (path.exists() or path.is_symlink()):
+        path.unlink()
+    elif kind == "dir":
+        remove_if_empty(path)
+
+
+def undo_entries(entries):
+    """Undo every entry, even past a failure, so one stuck path cannot strand the rest."""
+    failures = []
+    for entry in reversed(entries):
+        try:
+            undo_entry(entry)
+        except OSError as exc:
+            failures.append(str(exc))
+    if failures:
+        raise HarnessError("rollback is incomplete:\n  " + "\n  ".join(failures))
 
 
 def remove_if_empty(path):
@@ -2466,6 +2486,7 @@ def install_project(args, stack, target, run):
     merge_gitignore(source, target, args.stack, stack, run)
     write_project_files(source, target, args.stack, values, in_place, run)
     ensure_git(target, run)
+    run.write(target / OWNED_MANIFEST, json.dumps(owned_manifest(target, args.stack), indent=2) + "\n")
     commit_config(source, target, args.stack, stack, values, run)
     run.finish()
     return name
@@ -2533,6 +2554,201 @@ def cmd_install(args):
     return 0
 
 
+# --- update -----------------------------------------------------------------
+
+
+def file_hash(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def owned_files(root, stack):
+    """Harness-owned paths under root. Everything else belongs to the project."""
+    root = Path(root)
+    paths = [root / name for name in OWNED_FILES]
+    for tree in OWNED_TREES + (f".harness/stacks/{stack}",):
+        paths += [p for p in (root / tree).rglob("*") if p.is_file() and not set(p.parts) & GENERATED_NAMES]
+    paths += [p for p in (root / ".harness/docs").glob("*.md") if p.name not in PROJECT_OWNED_DOCS]
+    return sorted(str(p.relative_to(root)) for p in paths if p.is_file())
+
+
+def owned_manifest(root, stack):
+    return {"version": HARNESS_VERSION, "files": {rel: file_hash(Path(root) / rel) for rel in owned_files(root, stack)}}
+
+
+def update_action(rel, target, incoming, recorded):
+    """same, add, replace or conflict: `recorded` is what the last install wrote."""
+    current = target / rel
+    if not current.is_file():
+        return "conflict" if rel in recorded else "add"
+    digest = file_hash(current)
+    if digest == incoming:
+        return "same"
+    return "replace" if recorded.get(rel) == digest else "conflict"
+
+
+def update_plan(target, stack, recorded):
+    plan = {}
+    for rel in owned_files(SOURCE_ROOT, stack):
+        action = update_action(rel, target, file_hash(SOURCE_ROOT / rel), recorded)
+        plan.setdefault(action, []).append(rel)
+    return plan
+
+
+def merged_settings(target):
+    """The project's settings with the harness hook entries refreshed and all else kept."""
+    settings = load_json(target / SETTINGS)
+    incoming = load_json(SOURCE_ROOT / SETTINGS)
+    if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
+        raise HarnessError(f"{SETTINGS} is not a settings object; fix it before updating")
+    merged = copy.deepcopy(settings)
+    hooks = merged.setdefault("hooks", {})
+    for event, groups in incoming["hooks"].items():
+        kept = []
+        for group in hooks.get(event, []):
+            entries = group.get("hooks", []) if isinstance(group, dict) else []
+            others = [hook for hook in entries if not is_any_harness_hook(hook)]
+            if others or not entries:
+                kept.append({**group, "hooks": others} if isinstance(group, dict) else group)
+        hooks[event] = kept + groups
+    return merged
+
+
+def is_any_harness_hook(hook):
+    return isinstance(hook, dict) and "harness" in str(hook.get("command", "")) and "hook" in (hook.get("args") or [])
+
+
+def dirty_owned_paths(target, paths):
+    try:
+        result = subprocess.run(["git", "-C", str(target), "status", "--porcelain", "--", *paths],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    except OSError:
+        return []
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def print_update_plan(plan, settings_change):
+    for action, label in (("add", "add"), ("replace", "replace"), ("conflict", "locally modified")):
+        for rel in plan.get(action, []):
+            print(f"  {label}: {rel}")
+    if settings_change:
+        print(f"  merge hooks: {SETTINGS}")
+    if not any(plan.get(a) for a in ("add", "replace", "conflict")) and not settings_change:
+        print("  nothing to update")
+
+
+def apply_update(target, stack, plan, recorded, settings, force):
+    run = InitRun(target)
+    files = dict(recorded)
+    with signals_raise():
+        try:
+            for rel in plan.get("add", []) + plan.get("replace", []) + (plan.get("conflict", []) if force else []):
+                run.copy_file(SOURCE_ROOT / rel, target / rel)
+                files[rel] = file_hash(SOURCE_ROOT / rel)
+            if not force:
+                for rel in plan.get("conflict", []):
+                    run.copy_file(SOURCE_ROOT / rel, target / f"{rel}.new")
+                    warn(f"{rel} has local changes: kept it, incoming version is {rel}.new")
+            for rel in plan.get("same", []):
+                files[rel] = file_hash(SOURCE_ROOT / rel)
+            if settings is not None:
+                run.write(target / SETTINGS, json.dumps(settings, indent=2) + "\n")
+            manifest = {"version": HARNESS_VERSION, "files": files}
+            run.write(target / OWNED_MANIFEST, json.dumps(manifest, indent=2) + "\n")
+            run.finish()
+        except BaseException as exc:
+            for number in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(number, signal.SIG_IGN)
+            run.rollback()
+            if isinstance(exc, HarnessError) or not isinstance(exc, Exception):
+                raise
+            raise HarnessError(f"update failed and was rolled back: {exc}")
+
+
+def recover_interrupted_update(target):
+    if (target / MANIFEST).is_file():
+        entries = read_manifest(target)
+        warn(f"found an interrupted update: rolling back the {len(entries)} changes it listed")
+        undo_and_forget(target, entries)
+
+
+def cmd_update(args):
+    target = find_root()
+    config = load_config(target)
+    if config["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: there is nothing to update")
+    if target == SOURCE_ROOT or load_config(SOURCE_ROOT)["stack"] is not None:
+        raise HarnessError("run the global `harness` from a scaffold clone, not the project's own copy")
+    stack = config["stack"]
+    if not (SOURCE_ROOT / HARNESS_DIR / "stacks" / stack).is_dir():
+        raise HarnessError(f"the scaffold has no stack {stack}")
+    if not args.dry_run:
+        recover_interrupted_update(target)
+    path = target / OWNED_MANIFEST
+    recorded = load_json(path).get("files", {}) if path.is_file() else {}
+    plan = update_plan(target, stack, recorded)
+    merged = merged_settings(target)
+    settings = merged if merged != load_json(target / SETTINGS) else None
+    print_update_plan(plan, settings is not None)
+    if args.dry_run:
+        ok("dry run: nothing changed")
+        return 0
+    dirty = dirty_owned_paths(target, [rel for rel in owned_files(target, stack)] + [SETTINGS])
+    if dirty and not args.force:
+        raise HarnessError("harness-owned files have uncommitted changes; commit them or use --force:\n  "
+                           + "\n  ".join(dirty[:BRIEFING_LIST_CAP]))
+    apply_update(target, stack, plan, recorded, settings, args.force)
+    ok(f"updated to harness {HARNESS_VERSION}")
+    if report_check(target, with_tests=False) != 0:
+        fail("updated, but check failed: fix the problems above")
+        return EXIT_INIT_CHECK_FAILED
+    return 0
+
+
+# --- ci ---------------------------------------------------------------------
+
+
+def yaml_step(step):
+    """One workflow step. JSON strings are valid YAML, so values need no custom quoting."""
+    lines = []
+    for key in ("name", "uses", "run", "working-directory"):
+        if key in step:
+            lines.append(f"{'- ' if not lines else '  '}{key}: {json.dumps(step[key])}")
+    if step.get("with"):
+        lines.append("  with:")
+        lines += [f"    {key}: {json.dumps(value)}" for key, value in step["with"].items()]
+    return [f"      {line}" for line in lines]
+
+
+def render_workflow(steps):
+    common_start = [{"uses": "actions/checkout@v7"},
+                    {"uses": "actions/setup-python@v7", "with": {"python-version": "3.12"}}]
+    final = [{"name": "Harness check", "run": ".harness/bin/harness check"}]
+    lines = ["name: harness", "on:", "  push:", "  pull_request:", "jobs:", "  check:",
+             "    runs-on: ubuntu-latest", "    steps:"]
+    for step in common_start + steps + final:
+        lines += yaml_step(step)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_ci_github(args):
+    target = find_root()
+    config = load_config(target)
+    if config["stack"] is None:
+        raise HarnessError("this is the scaffold, not a project: run `harness init <stack>` first")
+    stack = load_json(target / HARNESS_DIR / "stacks" / config["stack"] / "stack.json")
+    workflow = target / WORKFLOW
+    if workflow.exists() and not args.force:
+        raise HarnessError(f"{WORKFLOW} already exists; use --force to replace it")
+    steps = stack.get("ci", {}).get("steps", [])
+    workflow.parent.mkdir(parents=True, exist_ok=True)
+    workflow.write_text(render_workflow(steps), encoding="utf-8")
+    ok(f"wrote {WORKFLOW}")
+    if not steps:
+        warn(f"stack {config['stack']} declares no CI setup: add your toolchain steps before the "
+             f"harness check step in {WORKFLOW}")
+    return 0
+
+
 # --- Entry point ------------------------------------------------------------
 
 
@@ -2582,6 +2798,15 @@ def build_parser():
 
     approve = command("approve", cmd_approve, "record human approval of a spec")
     approve.add_argument("feature")
+
+    update = command("update", cmd_update, "update harness-owned files from the scaffold")
+    update.add_argument("--dry-run", action="store_true")
+    update.add_argument("--force", action="store_true")
+
+    ci_targets = command("ci", None, "generate a CI workflow").add_subparsers(dest="ci_target", required=True)
+    github = ci_targets.add_parser("github", help="write the GitHub Actions workflow", allow_abbrev=False)
+    github.add_argument("--force", action="store_true")
+    github.set_defaults(handler=cmd_ci_github)
 
     hook = command("hook", cmd_hook, "Claude Code hook entry point")
     hook.add_argument("event", choices=["pre-tool-use", "session-start"])
