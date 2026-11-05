@@ -9,6 +9,7 @@ Its key property: the rules are **executed, not just described**. The lifecycle 
 role permissions live in one file, and a CLI and a Claude Code hook enforce them
 outside the model.
 
+
 This harness is for Claude Code only.
 
 ## Requirements
